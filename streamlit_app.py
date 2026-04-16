@@ -6,23 +6,8 @@ from plotly.subplots import make_subplots
 import numpy as np
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-import requests
 import warnings
 warnings.filterwarnings('ignore')
-
-# ==================== 重试装饰器（应对网络波动） ====================
-def is_retryable_exception(exception):
-    """判断是否应该重试的网络异常"""
-    return isinstance(exception, (requests.exceptions.RequestException, ConnectionError, TimeoutError))
-
-@retry(stop=stop_after_attempt(3), 
-       wait=wait_exponential(multiplier=1, min=2, max=10),
-       retry=retry_if_exception_type(is_retryable_exception))
-def safe_fetch_hist_data(code, period, start_date, end_date):
-    """带重试的数据获取"""
-    return ak.stock_zh_a_hist(symbol=code, period=period,
-                              start_date=start_date, end_date=end_date, adjust="qfq")
 
 # ==================== 数据获取模块 ====================
 @st.cache_data(ttl=86400)
@@ -39,6 +24,7 @@ def get_all_stock_codes():
     except Exception as e:
         st.warning(f"读取本地股票列表失败（{e}），使用网络获取")
     
+    # 回退：从东方财富网获取
     try:
         stock_df = ak.stock_zh_a_spot_em()
         stock_df = stock_df[stock_df['代码'].str.match(r'(60|00|30)')]
@@ -47,13 +33,13 @@ def get_all_stock_codes():
         st.error(f"获取股票列表失败: {e}")
         return [], []
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_stock_data_worker(code, period="daily", days=100):
-    """获取单只股票历史数据（带缓存和重试）"""
+    """获取单只股票历史数据（线程安全）"""
     try:
         end_date = datetime.now().strftime("%Y%m%d")
         start_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
-        df = safe_fetch_hist_data(code, period, start_date, end_date)
+        df = ak.stock_zh_a_hist(symbol=code, period=period,
+                                start_date=start_date, end_date=end_date, adjust="qfq")
         if df.empty:
             return None
         df.rename(columns={
@@ -78,117 +64,132 @@ def get_all_stocks_data_parallel(codes, period="daily", days=100, max_workers=8)
         return pd.concat(results, ignore_index=True)
     return pd.DataFrame()
 
-# ==================== 技术指标（纯 pandas，向量化） ====================
+# ==================== 技术指标（纯 pandas） ====================
 def calculate_indicators(df):
-    """一次性计算所有股票的指标（向量化）"""
     if df.empty:
         return df
-    # 移动平均线
-    df['MA5'] = df.groupby('code')['close'].transform(lambda x: x.rolling(5, min_periods=1).mean())
-    df['MA10'] = df.groupby('code')['close'].transform(lambda x: x.rolling(10, min_periods=1).mean())
-    df['MA20'] = df.groupby('code')['close'].transform(lambda x: x.rolling(20, min_periods=1).mean())
-    df['MA60'] = df.groupby('code')['close'].transform(lambda x: x.rolling(60, min_periods=1).mean())
+    df['MA5'] = df['close'].rolling(5).mean()
+    df['MA10'] = df['close'].rolling(10).mean()
+    df['MA20'] = df['close'].rolling(20).mean()
+    df['MA60'] = df['close'].rolling(60).mean()
     
-    # MACD（按股票分组）
-    def macd_group(group):
-        exp1 = group['close'].ewm(span=12, adjust=False).mean()
-        exp2 = group['close'].ewm(span=26, adjust=False).mean()
-        group['MACD'] = exp1 - exp2
-        group['MACD_signal'] = group['MACD'].ewm(span=9, adjust=False).mean()
-        group['MACD_hist'] = group['MACD'] - group['MACD_signal']
-        return group
-    df = df.groupby('code', group_keys=False).apply(macd_group)
+    # MACD
+    exp1 = df['close'].ewm(span=12, adjust=False).mean()
+    exp2 = df['close'].ewm(span=26, adjust=False).mean()
+    df['MACD'] = exp1 - exp2
+    df['MACD_signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+    df['MACD_hist'] = df['MACD'] - df['MACD_signal']
     
     # RSI
-    def rsi_group(group):
-        delta = group['close'].diff()
-        gain = delta.where(delta > 0, 0).rolling(14, min_periods=1).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14, min_periods=1).mean()
-        rs = gain / loss
-        group['RSI'] = 100 - (100 / (1 + rs))
-        return group
-    df = df.groupby('code', group_keys=False).apply(rsi_group)
+    delta = df['close'].diff()
+    gain = delta.where(delta > 0, 0).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
     
     # 布林带
-    df['BB_middle'] = df.groupby('code')['close'].transform(lambda x: x.rolling(20, min_periods=1).mean())
-    bb_std = df.groupby('code')['close'].transform(lambda x: x.rolling(20, min_periods=1).std())
+    df['BB_middle'] = df['close'].rolling(20).mean()
+    bb_std = df['close'].rolling(20).std()
     df['BB_upper'] = df['BB_middle'] + 2 * bb_std
     df['BB_lower'] = df['BB_middle'] - 2 * bb_std
     
-    # 成交量均线
-    df['VOL_MA5'] = df.groupby('code')['volume'].transform(lambda x: x.rolling(5, min_periods=1).mean())
-    
-    # 金叉死叉
-    df['golden_cross'] = (df['MA5'] > df['MA10']) & (df.groupby('code')['MA5'].shift(1) <= df.groupby('code')['MA10'].shift(1))
-    df['death_cross'] = (df['MA5'] < df['MA10']) & (df.groupby('code')['MA5'].shift(1) >= df.groupby('code')['MA10'].shift(1))
-    
-    # 多头/空头排列
-    df['bullish_arrange'] = (df['MA5'] > df['MA10']) & (df['MA10'] > df['MA20']) & (df['MA20'] > df['MA60'])
-    df['bearish_arrange'] = (df['MA5'] < df['MA10']) & (df['MA10'] < df['MA20']) & (df['MA20'] < df['MA60'])
-    
+    df['VOL_MA5'] = df['volume'].rolling(5).mean()
+    df['golden_cross'] = (df['MA5'] > df['MA10']) & (df['MA5'].shift(1) <= df['MA10'].shift(1))
+    df['death_cross'] = (df['MA5'] < df['MA10']) & (df['MA5'].shift(1) >= df['MA10'].shift(1))
+    # 短期多头（仅用于短线参考）
+    df['short_bullish'] = (df['MA5'] > df['MA10']) & (df['close'] > df['MA5'])
     return df
 
 def add_advanced_indicators(df):
-    """添加量比、ATR等（向量化）"""
     if df.empty:
         return df
-    df['volume_ratio'] = df.groupby('code')['volume'].transform(lambda x: x / x.rolling(5, min_periods=1).mean())
-    
+    # 量比（相对于5日均量）
+    df['volume_ratio'] = df['volume'] / df['volume'].rolling(5).mean()
     # ATR
-    def atr_group(group):
-        high_low = group['high'] - group['low']
-        high_close = (group['high'] - group['close'].shift()).abs()
-        low_close = (group['low'] - group['close'].shift()).abs()
-        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        group['ATR'] = tr.rolling(14, min_periods=1).mean()
-        group['stop_loss'] = group['close'] - 2 * group['ATR']
-        return group
-    df = df.groupby('code', group_keys=False).apply(atr_group)
-    df['ADX'] = 25  # 简化，不影响评分
+    high_low = df['high'] - df['low']
+    high_close = (df['high'] - df['close'].shift()).abs()
+    low_close = (df['low'] - df['close'].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df['ATR'] = tr.rolling(14).mean()
+    df['stop_loss'] = df['close'] - 2 * df['ATR']
     return df
 
-def score_stock(group):
-    """对单个股票的整个历史数据评分（取最新一天）"""
-    latest = group.iloc[-1]
+def score_stock(df):
+    """短线交易评分（侧重量价异动、短期趋势）"""
+    latest = df.iloc[-1]
+    # 计算额外短线指标
+    # 5日最高价
+    high_5d = df['high'].rolling(5).max().iloc[-1]
+    # 5日涨幅
+    price_5d_ago = df['close'].iloc[-6] if len(df) >= 6 else df['close'].iloc[0]
+    gain_5d = (latest['close'] - price_5d_ago) / price_5d_ago * 100
+    
     score = 0
-    if latest['bullish_arrange']:
-        score += 25
-    elif latest['MA5'] > latest['MA20']:
+    
+    # 1. 短期趋势 (0-20)
+    if latest['MA5'] > latest['MA10']:
+        score += 10
+    if latest['close'] > latest['MA5']:
+        score += 10
+    
+    # 2. 动量与突破 (0-30)
+    # 今日涨幅
+    daily_return = (latest['close'] - df['close'].iloc[-2]) / df['close'].iloc[-2] * 100 if len(df) >= 2 else 0
+    if daily_return > 3:
+        score += 10
+    if latest['close'] > high_5d * 0.98:   # 接近5日高点
         score += 10
     if latest['golden_cross']:
-        score += 15
-    if 30 <= latest['RSI'] <= 50:
         score += 10
-    elif 50 < latest['RSI'] <= 70:
-        score += 5
+    
+    # 3. 成交量异动 (0-25)
     if latest['volume_ratio'] > 1.5:
         score += 10
-    if latest['volume'] > latest['VOL_MA5'] * 1.2:
+    if len(df) >= 2 and latest['volume'] > df['volume'].iloc[-2] * 2:
         score += 10
-    if latest['ADX'] > 25:
+    # 连续放量（最近3日成交量均 > 20日均量*1.2）
+    vol_ma20 = df['volume'].rolling(20).mean().iloc[-1]
+    recent_vol_condition = (df['volume'].iloc[-3:] > vol_ma20 * 1.2).all() if len(df) >= 3 else False
+    if recent_vol_condition:
+        score += 5
+    
+    # 4. 位置与风险控制 (0-25)
+    if 50 <= latest['RSI'] <= 70:
         score += 10
-    if 0.02 <= latest['ATR'] / latest['close'] <= 0.05:
+    elif latest['RSI'] > 80:
+        score -= 10
+    
+    if 5 <= gain_5d <= 15:
         score += 10
-    return min(score, 100)
+    elif gain_5d > 20:
+        score -= 10
+    
+    volatility = latest['ATR'] / latest['close'] * 100
+    if 2 <= volatility <= 6:
+        score += 5
+    elif volatility > 10:
+        score -= 5
+    
+    return max(0, min(100, score))
 
 def filter_stocks_by_score(all_data, min_score=60):
-    """对全部股票进行评分筛选（向量化处理后分组评分）"""
     if all_data.empty:
         return pd.DataFrame()
-    # 先计算所有指标（一次性）
-    all_data = calculate_indicators(all_data)
-    all_data = add_advanced_indicators(all_data)
-    
     results = []
     for code, group in all_data.groupby('code'):
         if len(group) < 60:
             continue
         group = group.sort_values('date')
+        group = calculate_indicators(group)
+        group = add_advanced_indicators(group)
         score = score_stock(group)
         latest = group.iloc[-1].copy()
         latest['score'] = score
-        keep_cols = ['code', 'close', 'MA5', 'MA10', 'MA20', 'RSI', 'volume_ratio', 'ADX', 'ATR', 'stop_loss', 'score']
+        keep_cols = ['code', 'close', 'MA5', 'MA10', 'RSI', 'volume_ratio', 'ATR', 'stop_loss', 'score']
         results.append({k: latest[k] for k in keep_cols if k in latest})
+    
+    if not results:
+        return pd.DataFrame()
     df_result = pd.DataFrame(results)
     df_result = df_result[df_result['score'] >= min_score].sort_values('score', ascending=False)
     return df_result
@@ -208,16 +209,15 @@ def get_market_trend(days=20):
         return True
 
 # ==================== Streamlit 界面 ====================
-st.set_page_config(page_title="A股智能选股系统（优化版）", layout="wide")
-st.title("📈 A股智能选股系统 - 短线交易参考")
-st.markdown("基于趋势、动量、成交量、波动率复合评分模型（支持缓存与快速扫描）")
+st.set_page_config(page_title="A股短线选股系统", layout="wide")
+st.title("⚡ A股短线交易参考系统")
+st.markdown("基于量价异动、短期趋势、突破强度复合评分，聚焦1-5日交易机会")
 
 with st.sidebar:
     st.header("⚙️ 参数设置")
-    days = st.slider("历史数据天数（越少越快）", 20, 120, 40, 10)
-    min_score = st.slider("最低评分阈值", 0, 100, 60, 5)
+    days = st.slider("历史数据天数", 30, 200, 60, 10)
+    min_score = st.slider("最低评分阈值", 0, 100, 65, 5)
     max_workers = st.slider("并行线程数", 2, 16, 6, 2)
-    max_stocks = st.slider("最大扫描股票数量（0=全部，建议500以内）", 0, 5000, 500, 100)
     use_market_filter = st.checkbox("开启大盘过滤", True)
     if st.button("🚀 开始扫描", type="primary"):
         st.session_state['run_scan'] = True
@@ -233,29 +233,25 @@ if 'run_scan' in st.session_state and st.session_state['run_scan']:
         if not codes:
             st.error("获取股票列表失败")
             st.stop()
-        original_count = len(codes)
-        if max_stocks > 0 and len(codes) > max_stocks:
-            codes = codes[:max_stocks]
-            names = names[:max_stocks]
-        st.info(f"✅ 共 {original_count} 只股票，本次扫描 {len(codes)} 只")
+        st.info(f"✅ 共 {len(codes)} 只股票（沪深+创业板）")
     
-    with st.spinner(f"使用 {max_workers} 个线程并行获取数据（首次约需1-3分钟）..."):
+    with st.spinner(f"使用 {max_workers} 个线程并行获取数据（约需几分钟）..."):
         all_data = get_all_stocks_data_parallel(codes, "daily", days, max_workers)
         if all_data.empty:
-            st.error("数据获取失败，请检查网络或稍后重试")
+            st.error("数据获取失败")
             st.stop()
         st.success(f"✅ 获取到 {len(all_data['code'].unique())} 只股票数据")
     
-    with st.spinner("计算指标与评分（向量化加速）..."):
+    with st.spinner("计算短线指标与评分..."):
         scored_df = filter_stocks_by_score(all_data, min_score)
     
-    st.subheader(f"🏆 评分 ≥ {min_score} 的股票")
+    st.subheader(f"🏆 短线评分 ≥ {min_score} 的股票")
     if scored_df.empty:
-        st.info("无符合条件的股票，可降低评分阈值或增加扫描数量")
+        st.info("当前无符合条件的短线标的，可降低评分阈值")
     else:
         st.dataframe(scored_df, use_container_width=True)
         
-        st.subheader("📊 个股详情")
+        st.subheader("📊 个股技术分析")
         selected = st.selectbox("选择股票", scored_df['code'].tolist())
         stock_data = all_data[all_data['code'] == selected].sort_values('date')
         stock_data = calculate_indicators(stock_data)
@@ -279,12 +275,17 @@ if 'run_scan' in st.session_state and st.session_state['run_scan']:
                                  mode='lines', name='MACD', line=dict(color='blue')), row=3, col=1)
         fig.add_trace(go.Scatter(x=stock_data['date'], y=stock_data['MACD_signal'],
                                  mode='lines', name='Signal', line=dict(color='orange')), row=3, col=1)
-        fig.update_layout(height=800, title=f"{selected} 技术分析")
+        fig.update_layout(height=800, title=f"{selected} 短线技术分析")
         st.plotly_chart(fig, use_container_width=True)
     
     st.session_state['run_scan'] = False
 
 with st.sidebar:
     st.markdown("---")
-    st.markdown("**优化说明**：数据缓存 | 限制扫描数量 | 向量化计算 | 网络重试")
-    st.markdown("**评分权重**：趋势25 | 金叉15 | RSI 10 | 量比10 | 放量10 | ADX10 | 波动率10")
+    st.markdown("**短线评分因子**：")
+    st.markdown("""
+    - 短期趋势 (MA5>MA10, 价在MA5上)  
+    - 突破强度 (涨幅>3%, 接近5日高点, 金叉)  
+    - 量能异动 (量比>1.5, 倍量, 连续放量)  
+    - 风险控制 (RSI 50-70, 5日涨幅5-15%, 波动率2-6%)
+    """)
