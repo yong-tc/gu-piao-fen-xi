@@ -5,26 +5,35 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import numpy as np
 from datetime import datetime, timedelta
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed  # 改用线程池
 import warnings
 warnings.filterwarnings('ignore')
 
 # ==================== 数据获取模块 ====================
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=86400)  # 缓存一天
 def get_all_stock_codes():
-    """获取沪深A股（含创业板）全部股票代码"""
+    """获取沪深A股（含创业板）全部股票代码（优先使用本地缓存文件）"""
+    # 尝试读取本地预先保存的股票列表（快速）
     try:
-        stock_df = ak.stock_zh_a_spot_em()
-        stock_df = stock_df[stock_df['代码'].str.match(r'(60|00|30)')]
-        codes = stock_df['代码'].tolist()
-        names = stock_df['名称'].tolist()
+        df = pd.read_csv('stock_list.csv')
+        codes = df['代码'].tolist()
+        names = df['名称'].tolist()
         return codes, names
-    except Exception as e:
-        st.error(f"获取股票列表失败: {e}")
-        return [], []
+    except FileNotFoundError:
+        # 若本地文件不存在，则从网络获取（稍慢，但作为备用）
+        st.info("正在从网络获取股票列表（首次约需30秒）...")
+        try:
+            stock_df = ak.stock_zh_a_spot_em()
+            stock_df = stock_df[stock_df['代码'].str.match(r'(60|00|30)')]
+            codes = stock_df['代码'].tolist()
+            names = stock_df['名称'].tolist()
+            return codes, names
+        except Exception as e:
+            st.error(f"获取股票列表失败: {e}")
+            return [], []
 
 def fetch_stock_data_worker(code, period="daily", days=100):
-    """工作函数：获取单只股票历史数据"""
+    """工作函数：获取单只股票历史数据（线程安全）"""
     try:
         end_date = datetime.now().strftime("%Y%m%d")
         start_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
@@ -42,9 +51,9 @@ def fetch_stock_data_worker(code, period="daily", days=100):
         return None
 
 def get_all_stocks_data_parallel(codes, period="daily", days=100, max_workers=8):
-    """并行获取所有股票数据"""
+    """使用线程池并行获取所有股票数据（避免 PicklingError）"""
     results = []
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(fetch_stock_data_worker, code, period, days): code for code in codes}
         for future in as_completed(futures):
             result = future.result()
@@ -114,7 +123,7 @@ def add_advanced_indicators(df):
     df['ATR'] = tr.rolling(window=14).mean()
     df['stop_loss'] = df['close'] - 2 * df['ATR']
     
-    # ADX 简化（默认给25，不影响评分，如需精确可后续扩展）
+    # ADX 简化（默认给25，不影响评分）
     df['ADX'] = 25
     
     return df
@@ -193,7 +202,7 @@ with st.sidebar:
     st.header("⚙️ 参数设置")
     days = st.slider("历史数据天数", min_value=60, max_value=500, value=120, step=30)
     min_score = st.slider("最低评分阈值", min_value=0, max_value=100, value=60, step=5)
-    max_workers = st.slider("并行进程数", min_value=2, max_value=16, value=8, step=2)
+    max_workers = st.slider("并行线程数", min_value=2, max_value=16, value=6, step=2)  # 线程池推荐4-8
     use_market_filter = st.checkbox("开启大盘环境过滤", value=True)
     if st.button("🚀 开始扫描", type="primary"):
         st.session_state['run_scan'] = True
@@ -216,7 +225,7 @@ if 'run_scan' in st.session_state and st.session_state['run_scan']:
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    with st.spinner(f"正在使用 {max_workers} 个进程并行获取数据..."):
+    with st.spinner(f"正在使用 {max_workers} 个线程并行获取数据（首次可能较慢，请耐心等待）..."):
         all_data = get_all_stocks_data_parallel(codes, "daily", days, max_workers)
         progress_bar.progress(100)
         status_text.text(f"✅ 数据获取完成！共获取 {len(all_data['code'].unique())} 只股票数据")
