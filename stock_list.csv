@@ -1,0 +1,5 @@
+import akshare as ak
+df = ak.stock_zh_a_spot_em()
+df = df[df['代码'].str.match(r'(60|00|30)')]
+df[['代码', '名称']].to_csv('stock_list.csv', index=False)
+print(f"已保存 {len(df)} 只股票")
