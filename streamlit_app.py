@@ -151,11 +151,6 @@ def filter_stocks_by_score(all_data, min_score=60):
         latest['score'] = score
         keep_cols = ['code', 'close', 'MA5', 'MA10', 'MA20', 'RSI', 'volume_ratio', 'ADX', 'ATR', 'stop_loss', 'score']
         results.append({k: latest[k] for k in keep_cols if k in latest})
-    
-    # 如果没有符合条件的股票，直接返回空 DataFrame
-    if not results:
-        return pd.DataFrame()
-    
     df_result = pd.DataFrame(results)
     df_result = df_result[df_result['score'] >= min_score].sort_values('score', ascending=False)
     return df_result
