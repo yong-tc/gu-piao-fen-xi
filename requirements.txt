@@ -1,7 +1,6 @@
 streamlit>=1.28.0
 akshare>=1.12.0
 pandas>=2.0.0
-ta>=0.10.2            # 新增
 numpy>=1.24.0
 plotly>=5.17.0
 requests>=2.31.0
