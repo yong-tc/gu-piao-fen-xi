@@ -11,32 +11,51 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ==================== 配置 ====================
-# 内存安全限制（Streamlit Cloud 免费版约 1GB）
-DEFAULT_MAX_STOCKS = 300      # 默认扫描300只（约占用300-400MB）
-DEFAULT_DAYS = 30             # 历史数据天数（30天足够短线）
-DEFAULT_WORKERS = 4           # 线程数（不宜过高）
+DEFAULT_MAX_STOCKS = 300      # 默认扫描300只
+DEFAULT_DAYS = 30             # 历史数据天数
+DEFAULT_WORKERS = 4           # 线程数
 
-# ==================== 数据获取 ====================
-@st.cache_data(ttl=86400)
-def get_all_stock_codes():
-    """获取股票列表（优先本地缓存）"""
+# ==================== 股票列表获取（支持多种排序） ====================
+@st.cache_data(ttl=3600)
+def get_stock_list_by_metric(sort_by="成交额", max_stocks=300):
+    """
+    获取股票列表，支持按成交额或涨跌幅排序
+    sort_by: "成交额" 或 "涨跌幅"
+    """
     try:
-        df = pd.read_csv('stock_list.csv', encoding='utf-8')
-        if '代码' in df.columns:
-            return df['代码'].tolist(), df['名称'].tolist()
-    except:
-        pass
-    
-    try:
-        stock_df = ak.stock_zh_a_spot_em()
-        stock_df = stock_df[stock_df['代码'].str.match(r'(60|00|30)')]
-        return stock_df['代码'].tolist(), stock_df['名称'].tolist()
+        # 获取A股实时行情
+        df = ak.stock_zh_a_spot_em()
+        # 筛选沪深A股 + 创业板（60/00/30开头）
+        df = df[df['代码'].str.match(r'(60|00|30)')]
+        
+        if sort_by == "成交额":
+            # 按成交额降序排序（成交额最大的在前）
+            df = df.sort_values('成交额', ascending=False)
+            st.info(f"📊 按成交额排序，选取前 {max_stocks} 只活跃股票")
+        else:  # 涨跌幅
+            # 按涨跌幅降序排序（涨幅最大的在前）
+            df = df.sort_values('涨跌幅', ascending=False)
+            st.info(f"📈 按涨跌幅排序，选取前 {max_stocks} 只强势股票")
+        
+        # 取前N只
+        codes = df['代码'].tolist()[:max_stocks]
+        names = df['名称'].tolist()[:max_stocks]
+        
+        # 同时保存一些信息供展示
+        extra_info = {
+            '成交额': df['成交额'].tolist()[:max_stocks] if '成交额' in df.columns else [],
+            '涨跌幅': df['涨跌幅'].tolist()[:max_stocks] if '涨跌幅' in df.columns else []
+        }
+        
+        return codes, names, extra_info
+        
     except Exception as e:
         st.error(f"获取股票列表失败: {e}")
-        return [], []
+        return [], [], {}
 
+# ==================== 数据获取 ====================
 def fetch_stock_data(code, days=30):
-    """获取单只股票数据（精简版，只保留必要字段）"""
+    """获取单只股票历史数据"""
     try:
         end = datetime.now().strftime("%Y%m%d")
         start = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
@@ -49,13 +68,12 @@ def fetch_stock_data(code, days=30):
             '最高': 'high', '最低': 'low', '成交量': 'volume'
         }, inplace=True)
         df['code'] = code
-        # 只保留必要列，减少内存
         return df[['code', 'date', 'open', 'high', 'low', 'close', 'volume']]
     except:
         return None
 
 def get_data_batch(codes, days=30, max_workers=4):
-    """分批获取数据（避免一次性加载过多）"""
+    """并行获取数据"""
     results = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(fetch_stock_data, code, days): code for code in codes}
@@ -67,9 +85,9 @@ def get_data_batch(codes, days=30, max_workers=4):
         return pd.concat(results, ignore_index=True)
     return pd.DataFrame()
 
-# ==================== 指标计算（纯pandas，向量化） ====================
+# ==================== 技术指标计算 ====================
 def calculate_indicators(df):
-    """计算技术指标（优化版，减少中间变量）"""
+    """计算技术指标"""
     if df.empty:
         return df
     
@@ -98,7 +116,7 @@ def calculate_indicators(df):
     # 量比
     df['volume_ratio'] = df.groupby('code')['volume'].transform(lambda x: x / x.rolling(5, min_periods=1).mean())
     
-    # ATR（简化）
+    # ATR
     def calc_atr(group):
         tr = pd.concat([
             group['high'] - group['low'],
@@ -128,10 +146,10 @@ def score_stock(group):
         score += 10
     if 0.02 <= latest['ATR'] / latest['close'] <= 0.05:
         score += 10
-    return min(score, 80)  # 最高80分（简化版）
+    return min(score, 80)
 
 def filter_stocks(all_data, min_score=50):
-    """筛选评分股票（内存优化版）"""
+    """筛选评分股票"""
     if all_data.empty:
         return pd.DataFrame()
     
@@ -150,6 +168,7 @@ def filter_stocks(all_data, min_score=50):
                 '收盘': round(latest['close'], 2),
                 'MA5': round(latest['MA5'], 2),
                 'MA10': round(latest['MA10'], 2),
+                'MA20': round(latest['MA20'], 2),
                 'RSI': round(latest['RSI'], 1),
                 '量比': round(latest['volume_ratio'], 2),
                 '止损': round(latest['stop_loss'], 2),
@@ -163,7 +182,7 @@ def filter_stocks(all_data, min_score=50):
 
 # ==================== 大盘趋势 ====================
 def get_market_trend():
-    """简单判断大盘趋势"""
+    """判断大盘趋势"""
     try:
         df = ak.stock_zh_a_hist(symbol="000001", period="daily", 
                                 start_date=(datetime.now() - timedelta(days=30)).strftime("%Y%m%d"),
@@ -179,85 +198,130 @@ def get_market_trend():
 # ==================== Streamlit 界面 ====================
 st.set_page_config(page_title="A股实时选股", layout="wide")
 st.title("📈 A股实时选股系统 - 短线交易参考")
-
-# 内存使用提示
-st.info("💡 内存安全模式：默认扫描300只股票，约占用300-400MB内存（Streamlit限制1GB）")
+st.markdown("基于趋势、动量、成交量复合评分模型 | 支持成交额/涨跌幅排序")
 
 with st.sidebar:
-    st.header("⚙️ 内存安全参数")
+    st.header("⚙️ 参数设置")
     
-    max_stocks = st.slider("扫描股票数量（内存安全建议 ≤ 500）", 50, 1000, DEFAULT_MAX_STOCKS, 50,
-                           help="股票数量越多，内存占用越大。300只约400MB，500只约600MB")
-    days = st.slider("历史数据天数（越少越快）", 20, 60, DEFAULT_DAYS, 5,
-                     help="30天足够短线参考，减少天数可降低内存")
+    # 股票排序方式选择
+    sort_method = st.radio(
+        "股票排序方式",
+        ["成交额排序（活跃股票）", "涨跌幅排序（强势股票）"],
+        help="成交额排序：选择市场最活跃的股票；涨跌幅排序：选择当日涨幅最大的股票"
+    )
+    
+    max_stocks = st.slider("扫描股票数量", 50, 800, 300, 50,
+                           help="300只约占用400MB内存，500只约650MB")
+    days = st.slider("历史数据天数", 20, 60, 30, 5)
     min_score = st.slider("最低评分阈值", 30, 80, 50, 5)
-    workers = st.slider("并行线程数", 2, 8, DEFAULT_WORKERS, 1)
+    workers = st.slider("并行线程数", 2, 8, 4, 1)
     use_market_filter = st.checkbox("大盘过滤", True)
     
     if st.button("🚀 开始扫描", type="primary"):
         st.session_state['run'] = True
     
     st.markdown("---")
-    st.markdown("**内存优化措施**")
-    st.markdown("- 限制扫描数量（默认300）")
-    st.markdown("- 减少历史天数（默认30）")
-    st.markdown("- 只保留必要列")
-    st.markdown("- 主动垃圾回收")
+    st.markdown("**排序说明**")
+    if sort_method == "成交额排序（活跃股票）":
+        st.markdown("✅ 选择成交额最大的股票，流动性好，适合短线")
+    else:
+        st.markdown("✅ 选择涨跌幅最大的股票，捕捉强势股，波动较大")
 
 if 'run' in st.session_state and st.session_state['run']:
     # 大盘过滤
     if use_market_filter and not get_market_trend():
-        st.warning("⚠️ 大盘趋势偏弱，建议谨慎")
+        st.warning("⚠️ 大盘趋势偏弱，建议谨慎操作")
         st.session_state['run'] = False
         st.stop()
     
-    # 获取股票列表
+    # 获取股票列表（根据排序方式）
     with st.spinner("获取股票列表..."):
-        codes, names = get_all_stock_codes()
+        sort_key = "成交额" if "成交额" in sort_method else "涨跌幅"
+        codes, names, extra = get_stock_list_by_metric(sort_key, max_stocks)
+        
         if not codes:
-            st.error("获取失败")
+            st.error("获取股票列表失败")
             st.stop()
         
-        # 限制数量
-        if len(codes) > max_stocks:
-            codes = codes[:max_stocks]
-        st.info(f"✅ 扫描 {len(codes)} 只股票（内存安全）")
+        st.success(f"✅ 已按{sort_key}排序，选取前 {len(codes)} 只股票")
+        
+        # 显示前10只股票信息
+        with st.expander(f"📋 前10只{sort_key}最大股票"):
+            preview_df = pd.DataFrame({
+                '代码': codes[:10],
+                '名称': names[:10],
+                sort_key: extra.get(sort_key, ['-']*10)[:10]
+            })
+            st.dataframe(preview_df, use_container_width=True)
     
     # 获取数据
-    with st.spinner(f"获取数据（{days}天，{workers}线程）..."):
+    with st.spinner(f"正在获取 {len(codes)} 只股票数据（{days}天历史）..."):
         all_data = get_data_batch(codes, days, workers)
         if all_data.empty:
             st.error("数据获取失败")
             st.stop()
-        st.success(f"✅ 获取 {len(all_data['code'].unique())} 只")
+        st.success(f"✅ 成功获取 {len(all_data['code'].unique())} 只股票数据")
         gc.collect()
     
     # 计算评分
-    with st.spinner("计算评分..."):
+    with st.spinner("正在计算技术指标和评分..."):
         result_df = filter_stocks(all_data, min_score)
         del all_data
         gc.collect()
     
     # 显示结果
     if result_df.empty:
-        st.info(f"无股票达到评分阈值 {min_score}")
+        st.info(f"📭 没有股票达到评分阈值 {min_score}，可降低阈值或调整参数")
     else:
-        st.subheader(f"🏆 评分 ≥ {min_score} 的股票")
+        st.subheader(f"🏆 评分 ≥ {min_score} 的股票（共 {len(result_df)} 只）")
         st.dataframe(result_df, use_container_width=True)
         
-        # 评分分布
-        fig = go.Figure(data=[go.Bar(x=result_df['代码'], y=result_df['评分'])])
-        fig.update_layout(height=400)
-        st.plotly_chart(fig, use_container_width=True)
+        # 评分分布图
+        col1, col2 = st.columns(2)
+        with col1:
+            fig = go.Figure(data=[go.Bar(x=result_df['代码'][:20], y=result_df['评分'][:20])])
+            fig.update_layout(height=400, title="Top 20 股票评分")
+            st.plotly_chart(fig, use_container_width=True)
+        
+        with col2:
+            # 评分区间统计
+            bins = [0, 40, 50, 60, 70, 100]
+            labels = ['<40', '40-50', '50-60', '60-70', '≥70']
+            result_df['评分区间'] = pd.cut(result_df['评分'], bins=bins, labels=labels)
+            score_dist = result_df['评分区间'].value_counts().sort_index()
+            fig2 = go.Figure(data=[go.Bar(x=score_dist.index, y=score_dist.values)])
+            fig2.update_layout(height=400, title="评分分布")
+            st.plotly_chart(fig2, use_container_width=True)
+        
+        # 个股详情（可选）
+        st.subheader("📊 个股详情")
+        selected = st.selectbox("选择股票查看详情", result_df['代码'].tolist())
+        stock_row = result_df[result_df['代码'] == selected].iloc[0]
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("收盘价", f"{stock_row['收盘']:.2f}")
+            st.metric("RSI", f"{stock_row['RSI']:.1f}")
+        with col2:
+            st.metric("MA5", f"{stock_row['MA5']:.2f}")
+            st.metric("MA10", f"{stock_row['MA10']:.2f}")
+        with col3:
+            st.metric("MA20", f"{stock_row['MA20']:.2f}")
+            st.metric("量比", f"{stock_row['量比']:.2f}")
     
     st.session_state['run'] = False
 
 # 使用说明
 with st.expander("📖 使用说明"):
     st.markdown("""
-    ### 内存安全模式说明
+    ### 股票排序方式说明
     
-    Streamlit Cloud 免费版限制 **1GB 内存**，本程序已优化：
+    | 排序方式 | 说明 | 适用场景 |
+    |---------|------|----------|
+    | **成交额排序** | 选择市场成交额最大的股票，流动性好 | 短线交易、稳健策略 |
+    | **涨跌幅排序** | 选择当日涨幅最大的股票，捕捉强势股 | 追涨策略、激进交易 |
+    
+    ### 内存安全建议
     
     | 扫描数量 | 预计内存 | 是否安全 |
     |---------|---------|---------|
@@ -265,10 +329,12 @@ with st.expander("📖 使用说明"):
     | 300只 | ~400MB | ✅ 安全（默认） |
     | 500只 | ~650MB | ⚠️ 接近上限 |
     | 800只 | ~900MB | ❌ 可能超限 |
-    | 1000只 | ~1.1GB | ❌ 会超限 |
     
-    **建议**：
-    - 首次使用：扫描 **200只** 测试
-    - 稳定后：可尝试 **300-400只**
-    - 如需扫描更多，请使用拆分架构方案
+    ### 评分模型
+    - 多头排列：25分
+    - 金叉信号：15分
+    - RSI健康区：10分
+    - 量比放大：10分
+    - 成交量放大：10分
+    - 温和波动率：10分
     """)
