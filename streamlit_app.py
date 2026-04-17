@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import akshare as ak
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import numpy as np
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -11,13 +10,13 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ==================== 配置 ====================
-DEFAULT_MAX_STOCKS = 300
+DEFAULT_MAX_STOCKS = 200      # 默认200只，内存安全
 DEFAULT_DAYS = 30
 DEFAULT_WORKERS = 4
 
 # ==================== 股票列表获取 ====================
 @st.cache_data(ttl=3600)
-def get_stock_list_by_metric(sort_by="成交额", max_stocks=300):
+def get_stock_list_by_metric(sort_by="成交额", max_stocks=200):
     """获取股票列表，支持按成交额或涨跌幅排序"""
     try:
         df = ak.stock_zh_a_spot_em()
@@ -26,26 +25,23 @@ def get_stock_list_by_metric(sort_by="成交额", max_stocks=300):
         
         if sort_by == "成交额":
             df = df.sort_values('成交额', ascending=False)
+            st.info(f"📊 按成交额排序，选取前 {max_stocks} 只活跃股票")
         else:
             df = df.sort_values('涨跌幅', ascending=False)
+            st.info(f"📈 按涨跌幅排序，选取前 {max_stocks} 只强势股票")
         
         codes = df['代码'].tolist()[:max_stocks]
         names = df['名称'].tolist()[:max_stocks]
         
-        extra_info = {
-            '成交额': df['成交额'].tolist()[:max_stocks] if '成交额' in df.columns else [],
-            '涨跌幅': df['涨跌幅'].tolist()[:max_stocks] if '涨跌幅' in df.columns else []
-        }
-        
-        return codes, names, extra_info
+        return codes, names
         
     except Exception as e:
         st.error(f"获取股票列表失败: {e}")
-        return [], [], {}
+        return [], []
 
-# ==================== 数据获取 ====================
+# ==================== 数据获取（确保列名正确） ====================
 def fetch_stock_data(code, days=30):
-    """获取单只股票历史数据"""
+    """获取单只股票历史数据，返回标准化的DataFrame"""
     try:
         end = datetime.now().strftime("%Y%m%d")
         start = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
@@ -53,50 +49,80 @@ def fetch_stock_data(code, days=30):
                                 start_date=start, end_date=end, adjust="qfq")
         if df.empty:
             return None
-        # 统一列名（英文）
+        
+        # 统一列名（英文，小写）
         df.rename(columns={
-            '日期': 'date', '开盘': 'open', '收盘': 'close',
-            '最高': 'high', '最低': 'low', '成交量': 'volume'
+            '日期': 'date', 
+            '开盘': 'open', 
+            '收盘': 'close',
+            '最高': 'high', 
+            '最低': 'low', 
+            '成交量': 'volume'
         }, inplace=True)
+        
         df['code'] = code
-        # 只保留必要列
+        df['date'] = pd.to_datetime(df['date'])
+        
+        # 只保留必要列，减少内存
         return df[['code', 'date', 'open', 'high', 'low', 'close', 'volume']]
+        
     except Exception as e:
         return None
 
 def get_data_batch(codes, days=30, max_workers=4):
     """并行获取数据"""
     results = []
+    progress_bar = st.progress(0)
+    total = len(codes)
+    
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(fetch_stock_data, code, days): code for code in codes}
-        for future in as_completed(futures):
-            r = future.result()
-            if r is not None:
-                results.append(r)
+        futures = {executor.submit(fetch_stock_data, code, days): idx for idx, code in enumerate(codes)}
+        
+        for idx, future in enumerate(as_completed(futures)):
+            result = future.result()
+            if result is not None:
+                results.append(result)
+            progress_bar.progress((idx + 1) / total)
+    
+    progress_bar.empty()
+    
     if results:
         return pd.concat(results, ignore_index=True)
     return pd.DataFrame()
 
 # ==================== 技术指标计算（修复版） ====================
 def calculate_indicators(df):
-    """计算技术指标"""
+    """计算技术指标，增加列存在性检查"""
     if df.empty:
         return df
     
-    # 确保列名正确
-    if 'volume' not in df.columns:
-        st.error("数据中没有成交量列")
+    # 检查必要列是否存在
+    required_cols = ['code', 'close', 'volume', 'high', 'low']
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        st.error(f"缺少必要列: {missing_cols}")
         return df
     
     # 移动平均线
-    df['MA5'] = df.groupby('code')['close'].transform(lambda x: x.rolling(5, min_periods=1).mean())
-    df['MA10'] = df.groupby('code')['close'].transform(lambda x: x.rolling(10, min_periods=1).mean())
-    df['MA20'] = df.groupby('code')['close'].transform(lambda x: x.rolling(20, min_periods=1).mean())
+    df['MA5'] = df.groupby('code')['close'].transform(
+        lambda x: x.rolling(5, min_periods=1).mean()
+    )
+    df['MA10'] = df.groupby('code')['close'].transform(
+        lambda x: x.rolling(10, min_periods=1).mean()
+    )
+    df['MA20'] = df.groupby('code')['close'].transform(
+        lambda x: x.rolling(20, min_periods=1).mean()
+    )
+    
+    # 成交量均线
+    df['VOL_MA5'] = df.groupby('code')['volume'].transform(
+        lambda x: x.rolling(5, min_periods=1).mean()
+    )
     
     # RSI
     def calc_rsi(group):
         if len(group) < 14:
-            group['RSI'] = 50
+            group['RSI'] = 50.0
             return group
         delta = group['close'].diff()
         gain = delta.where(delta > 0, 0).rolling(14, min_periods=1).mean()
@@ -104,19 +130,21 @@ def calculate_indicators(df):
         rs = gain / loss
         group['RSI'] = 100 - (100 / (1 + rs))
         return group
+    
     df = df.groupby('code', group_keys=False).apply(calc_rsi)
     
-    # 成交量均线
-    df['VOL_MA5'] = df.groupby('code')['volume'].transform(lambda x: x.rolling(5, min_periods=1).mean())
-    
-    # 金叉
-    df['golden_cross'] = (df['MA5'] > df['MA10']) & (df.groupby('code')['MA5'].shift(1) <= df.groupby('code')['MA10'].shift(1))
+    # 金叉判断
+    df['MA5_shift'] = df.groupby('code')['MA5'].shift(1)
+    df['MA10_shift'] = df.groupby('code')['MA10'].shift(1)
+    df['golden_cross'] = (df['MA5'] > df['MA10']) & (df['MA5_shift'] <= df['MA10_shift'])
     
     # 多头排列
     df['bullish_arrange'] = (df['MA5'] > df['MA10']) & (df['MA10'] > df['MA20'])
     
     # 量比
-    df['volume_ratio'] = df.groupby('code')['volume'].transform(lambda x: x / x.rolling(5, min_periods=1).mean())
+    df['volume_ratio'] = df.groupby('code')['volume'].transform(
+        lambda x: x / x.rolling(5, min_periods=1).mean()
+    )
     
     # ATR
     def calc_atr(group):
@@ -131,43 +159,55 @@ def calculate_indicators(df):
         group['ATR'] = tr.rolling(14, min_periods=1).mean()
         group['stop_loss'] = group['close'] - 2 * group['ATR']
         return group
+    
     df = df.groupby('code', group_keys=False).apply(calc_atr)
+    
+    # 删除临时列
+    df = df.drop(['MA5_shift', 'MA10_shift'], axis=1, errors='ignore')
     
     return df
 
 def score_stock(group):
-    """对单只股票评分"""
+    """对单只股票评分（取最新数据）"""
+    if group.empty:
+        return 0
+    
     latest = group.iloc[-1]
     score = 0
     
-    # 检查必要字段是否存在
-    if pd.isna(latest.get('bullish_arrange', False)):
-        return 0
-    
-    if latest['bullish_arrange']:
+    # 多头排列
+    if latest.get('bullish_arrange', False):
         score += 25
+    
+    # 金叉
     if latest.get('golden_cross', False):
         score += 15
     
+    # RSI
     rsi = latest.get('RSI', 50)
-    if 30 <= rsi <= 50:
-        score += 10
-    elif 50 < rsi <= 70:
-        score += 5
+    if pd.notna(rsi):
+        if 30 <= rsi <= 50:
+            score += 10
+        elif 50 < rsi <= 70:
+            score += 5
     
+    # 量比
     volume_ratio = latest.get('volume_ratio', 1)
-    if volume_ratio > 1.5:
+    if pd.notna(volume_ratio) and volume_ratio > 1.5:
         score += 10
     
+    # 成交量放大
     volume = latest.get('volume', 0)
     vol_ma5 = latest.get('VOL_MA5', 1)
-    if volume > vol_ma5 * 1.2:
+    if pd.notna(volume) and pd.notna(vol_ma5) and volume > vol_ma5 * 1.2:
         score += 10
     
+    # ATR波动率
     atr = latest.get('ATR', 0)
     close = latest.get('close', 1)
-    if 0.02 <= atr / close <= 0.05:
-        score += 10
+    if pd.notna(atr) and pd.notna(close) and close > 0:
+        if 0.02 <= atr / close <= 0.05:
+            score += 10
     
     return min(score, 80)
 
@@ -183,19 +223,21 @@ def filter_stocks(all_data, min_score=50):
     for code, group in all_data.groupby('code'):
         if len(group) < 20:
             continue
+        
         group = group.sort_values('date')
         score = score_stock(group)
+        
         if score >= min_score:
             latest = group.iloc[-1]
             results.append({
                 '代码': code,
-                '收盘': round(latest['close'], 2) if not pd.isna(latest['close']) else 0,
-                'MA5': round(latest['MA5'], 2) if not pd.isna(latest['MA5']) else 0,
-                'MA10': round(latest['MA10'], 2) if not pd.isna(latest['MA10']) else 0,
-                'MA20': round(latest['MA20'], 2) if not pd.isna(latest['MA20']) else 0,
-                'RSI': round(latest['RSI'], 1) if not pd.isna(latest['RSI']) else 50,
-                '量比': round(latest['volume_ratio'], 2) if not pd.isna(latest['volume_ratio']) else 1,
-                '止损': round(latest['stop_loss'], 2) if not pd.isna(latest['stop_loss']) else 0,
+                '收盘': round(latest['close'], 2) if pd.notna(latest['close']) else 0,
+                'MA5': round(latest['MA5'], 2) if pd.notna(latest['MA5']) else 0,
+                'MA10': round(latest['MA10'], 2) if pd.notna(latest['MA10']) else 0,
+                'MA20': round(latest['MA20'], 2) if pd.notna(latest['MA20']) else 0,
+                'RSI': round(latest['RSI'], 1) if pd.notna(latest['RSI']) else 50,
+                '量比': round(latest['volume_ratio'], 2) if pd.notna(latest['volume_ratio']) else 1,
+                '止损': round(latest['stop_loss'], 2) if pd.notna(latest['stop_loss']) else 0,
                 '评分': score
             })
     
@@ -215,8 +257,9 @@ def get_market_trend():
                                 end_date=datetime.now().strftime("%Y%m%d"))
         if df.empty:
             return True
+        df['ma20'] = df['收盘'].rolling(20).mean()
         latest_close = df['收盘'].iloc[-1]
-        ma20 = df['收盘'].rolling(20).mean().iloc[-1]
+        ma20 = df['ma20'].iloc[-1]
         return latest_close > ma20
     except:
         return True
@@ -231,14 +274,15 @@ with st.sidebar:
     
     sort_method = st.radio(
         "股票排序方式",
-        ["成交额排序（活跃股票）", "涨跌幅排序（强势股票）"]
+        ["成交额排序（活跃股票）", "涨跌幅排序（强势股票）"],
+        help="成交额排序：选择市场最活跃的股票；涨跌幅排序：选择当日涨幅最大的股票"
     )
     
-    max_stocks = st.slider("扫描股票数量", 50, 500, 250, 50,
-                           help="250只约占用350MB内存")
+    max_stocks = st.slider("扫描股票数量", 50, 500, 200, 50,
+                           help="200只约占用300MB内存，500只约650MB")
     days = st.slider("历史数据天数", 20, 60, 30, 5)
     min_score = st.slider("最低评分阈值", 30, 80, 50, 5)
-    workers = st.slider("并行线程数", 2, 6, 3, 1)
+    workers = st.slider("并行线程数", 2, 6, 4, 1)
     use_market_filter = st.checkbox("大盘过滤", True)
     
     if st.button("🚀 开始扫描", type="primary"):
@@ -254,7 +298,7 @@ if 'run' in st.session_state and st.session_state['run']:
     # 获取股票列表
     with st.spinner("获取股票列表..."):
         sort_key = "成交额" if "成交额" in sort_method else "涨跌幅"
-        codes, names, extra = get_stock_list_by_metric(sort_key, max_stocks)
+        codes, names = get_stock_list_by_metric(sort_key, max_stocks)
         
         if not codes:
             st.error("获取股票列表失败")
@@ -295,13 +339,13 @@ if 'run' in st.session_state and st.session_state['run']:
 with st.expander("📖 使用说明"):
     st.markdown("""
     ### 股票排序方式
-    - **成交额排序**：选择市场最活跃的股票，流动性好
+    - **成交额排序**：选择市场最活跃的股票，流动性好，适合短线
     - **涨跌幅排序**：选择当日涨幅最大的股票，捕捉强势股
     
     ### 内存安全建议
-    - 250只股票约占用350MB内存
-    - 300只股票约占用450MB内存
-    - 500只股票约占用700MB内存
+    - 200只股票约占用300MB内存 ✅ 安全
+    - 300只股票约占用450MB内存 ✅ 安全
+    - 500只股票约占用700MB内存 ⚠️ 接近上限
     
     ### 评分模型
     - 多头排列：25分
