@@ -5,6 +5,7 @@ import plotly.graph_objects as go
 import numpy as np
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 import gc
 import warnings
 warnings.filterwarnings('ignore')
@@ -13,31 +14,99 @@ warnings.filterwarnings('ignore')
 BATCH_SIZE = 200  # 每批处理200只股票
 DEFAULT_DAYS = 60
 DEFAULT_WORKERS = 4
+MAX_RETRIES = 3  # 最大重试次数
+RETRY_DELAY = 2  # 重试延迟（秒）
 
-# ==================== 获取全市场股票列表 ====================
+# ==================== 带重试的数据获取函数 ====================
+def fetch_with_retry(func, *args, **kwargs):
+    """带重试机制的函数调用"""
+    for attempt in range(MAX_RETRIES):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY * (attempt + 1))
+                continue
+            else:
+                raise e
+    return None
+
+# ==================== 获取全市场股票列表（多数据源备用） ====================
 @st.cache_data(ttl=3600)
 def get_all_stock_codes():
-    """获取沪深A股+创业板全部股票代码"""
+    """获取沪深A股+创业板全部股票代码（多数据源备用）"""
+    
+    # 方案1：尝试从东方财富获取
     try:
-        df = ak.stock_zh_a_spot_em()
-        # 筛选沪深A股 + 创业板（60/00/30开头）
+        df = fetch_with_retry(ak.stock_zh_a_spot_em)
         df = df[df['代码'].str.match(r'(60|00|30)')]
         codes = df['代码'].tolist()
         names = df['名称'].tolist()
-        return codes, names
+        if codes:
+            return codes, names
     except Exception as e:
-        st.error(f"获取股票列表失败: {e}")
-        return [], []
+        st.warning(f"从东方财富获取失败: {e}，尝试备用数据源...")
+    
+    # 方案2：尝试从新浪获取
+    try:
+        df = fetch_with_retry(ak.stock_zh_a_spot)
+        df = df[df['代码'].str.match(r'(60|00|30)')]
+        codes = df['代码'].tolist()
+        names = df['名称'].tolist()
+        if codes:
+            st.info("✅ 使用新浪数据源获取股票列表成功")
+            return codes, names
+    except Exception as e:
+        st.warning(f"从新浪获取失败: {e}，尝试本地缓存...")
+    
+    # 方案3：使用本地缓存的股票列表
+    try:
+        df = pd.read_csv('stock_list.csv', encoding='utf-8')
+        if '代码' in df.columns and len(df) > 0:
+            codes = df['代码'].tolist()
+            names = df['名称'].tolist()
+            st.info(f"✅ 使用本地缓存股票列表，共 {len(codes)} 只")
+            return codes, names
+    except:
+        pass
+    
+    # 方案4：使用预定义的股票池（沪深300+创业板50）
+    st.warning("使用备用股票池（沪深300+创业板50）")
+    try:
+        # 获取沪深300成分股
+        df_300 = fetch_with_retry(ak.index_stock_cons_cs000300)
+        codes_300 = df_300['成分券代码'].tolist()
+        
+        # 获取创业板50
+        df_cy = fetch_with_retry(ak.index_stock_cons_sz399673)
+        codes_cy = df_cy['成分券代码'].tolist()
+        
+        codes = list(set(codes_300 + codes_cy))
+        names = codes  # 暂时用代码代替名称
+        
+        if codes:
+            st.info(f"✅ 使用沪深300+创业板50股票池，共 {len(codes)} 只")
+            return codes, names
+    except:
+        pass
+    
+    st.error("所有数据源均失败，请检查网络后重试")
+    return [], []
 
-# ==================== 数据获取 ====================
+# ==================== 数据获取（带重试） ====================
 def fetch_stock_data(code, days=60):
-    """获取单只股票历史数据"""
+    """获取单只股票历史数据（带重试）"""
     try:
         end = datetime.now().strftime("%Y%m%d")
         start = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
-        df = ak.stock_zh_a_hist(symbol=code, period="daily",
-                                start_date=start, end_date=end, adjust="qfq")
-        if df.empty:
+        
+        df = fetch_with_retry(
+            ak.stock_zh_a_hist, 
+            symbol=code, period="daily",
+            start_date=start, end_date=end, adjust="qfq"
+        )
+        
+        if df is None or df.empty:
             return None
         
         df.rename(columns={
@@ -50,7 +119,7 @@ def fetch_stock_data(code, days=60):
         
         return df[['code', 'date', 'open', 'high', 'low', 'close', 'volume']]
         
-    except Exception:
+    except Exception as e:
         return None
 
 # ==================== 单只股票指标计算 ====================
@@ -494,10 +563,10 @@ def scan_all_stocks(codes, days=60, min_score=50, batch_size=BATCH_SIZE):
 def get_market_trend():
     """判断大盘趋势"""
     try:
-        df = ak.stock_zh_a_hist(symbol="000001", period="daily", 
-                                start_date=(datetime.now() - timedelta(days=30)).strftime("%Y%m%d"),
-                                end_date=datetime.now().strftime("%Y%m%d"))
-        if df.empty:
+        df = fetch_with_retry(ak.stock_zh_a_hist, symbol="000001", period="daily", 
+                              start_date=(datetime.now() - timedelta(days=30)).strftime("%Y%m%d"),
+                              end_date=datetime.now().strftime("%Y%m%d"))
+        if df is None or df.empty:
             return True
         df['ma20'] = df['收盘'].rolling(20).mean()
         latest_close = df['收盘'].iloc[-1]
@@ -564,7 +633,7 @@ if 'run' in st.session_state and st.session_state['run']:
         all_codes, all_names = get_all_stock_codes()
         
         if not all_codes:
-            st.error("获取股票列表失败")
+            st.error("获取股票列表失败，请检查网络后重试")
             st.stop()
         
         st.success(f"✅ 获取到 {len(all_codes)} 只股票（沪深A股+创业板）")
@@ -609,6 +678,14 @@ with st.expander("📖 使用说明"):
     - **全市场覆盖**: 沪深A股+创业板（约5000只）
     - **预计耗时**: 15-30分钟（取决于网络和服务器）
     
+    ### 数据源说明
+    
+    程序会按以下顺序尝试获取股票列表：
+    1. 东方财富数据源（优先）
+    2. 新浪数据源（备用）
+    3. 本地缓存（stock_list.csv）
+    4. 沪深300+创业板50（最后备用）
+    
     ### 风险排除法核心逻辑
     
     1. **K线高位排除**：股价处于近期高位（>75%分位）的排除
@@ -618,6 +695,4 @@ with st.expander("📖 使用说明"):
     5. **MACD绿峰排除**：MACD为负且柱状线为负的排除
     6. **KDJ峰值排除**：K>80且J>100，或从高位回落的排除
     7. **波动过小排除**：ATR/价格<1%的排除
-    
-    **加分项**：通过排除后，根据红峰初期、KDJ底部、放量等条件加分
     """)
