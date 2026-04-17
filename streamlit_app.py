@@ -10,13 +10,13 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ==================== 配置 ====================
-DEFAULT_MAX_STOCKS = 300
+DEFAULT_MAX_STOCKS = 200
 DEFAULT_DAYS = 60
 DEFAULT_WORKERS = 4
 
 # ==================== 股票列表获取 ====================
 @st.cache_data(ttl=3600)
-def get_stock_list_by_metric(sort_by="成交额", max_stocks=300):
+def get_stock_list_by_metric(sort_by="成交额", max_stocks=200):
     """获取股票列表，支持按成交额或涨跌幅排序"""
     try:
         df = ak.stock_zh_a_spot_em()
@@ -81,11 +81,17 @@ def get_data_batch(codes, days=60, max_workers=4):
         return pd.concat(results, ignore_index=True)
     return pd.DataFrame()
 
-# ==================== 技术指标计算 ====================
+# ==================== 技术指标计算（修复版） ====================
 def calculate_indicators(df):
     """计算技术指标（MACD、KDJ、RSI、均线、ATR等）"""
     if df.empty:
         return df
+    
+    # 确保数据类型正确
+    df['close'] = pd.to_numeric(df['close'], errors='coerce')
+    df['high'] = pd.to_numeric(df['high'], errors='coerce')
+    df['low'] = pd.to_numeric(df['low'], errors='coerce')
+    df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
     
     # 均线
     df['MA5'] = df.groupby('code')['close'].transform(lambda x: x.rolling(5, min_periods=1).mean())
@@ -99,6 +105,7 @@ def calculate_indicators(df):
     
     # 量比
     df['volume_ratio'] = df['volume'] / df['VOL_MA5']
+    df['volume_ratio'] = df['volume_ratio'].fillna(1)
     
     # ========== MACD指标 ==========
     def calc_macd(group):
@@ -112,10 +119,14 @@ def calculate_indicators(df):
         group['MACD'] = exp1 - exp2
         group['MACD_signal'] = group['MACD'].ewm(span=9, adjust=False).mean()
         group['MACD_hist'] = group['MACD'] - group['MACD_signal']
+        group['MACD'] = group['MACD'].fillna(0)
+        group['MACD_signal'] = group['MACD_signal'].fillna(0)
+        group['MACD_hist'] = group['MACD_hist'].fillna(0)
         return group
+    
     df = df.groupby('code', group_keys=False).apply(calc_macd)
     
-    # ========== KDJ指标 ==========
+    # ========== KDJ指标（修复版） ==========
     def calc_kdj(group):
         if len(group) < 9:
             group['K'] = 50
@@ -123,14 +134,30 @@ def calculate_indicators(df):
             group['J'] = 50
             return group
         
+        # 计算RSV
         low_list = group['low'].rolling(9, min_periods=1).min()
         high_list = group['high'].rolling(9, min_periods=1).max()
         rsv = (group['close'] - low_list) / (high_list - low_list) * 100
+        rsv = rsv.fillna(50)
         
-        group['K'] = rsv.ewm(com=2, adjust=False).mean()
-        group['D'] = group['K'].ewm(com=2, adjust=False).mean()
+        # 初始化K、D值
+        k_values = [50]
+        d_values = [50]
+        
+        for i in range(1, len(rsv)):
+            k = (2/3) * k_values[-1] + (1/3) * rsv.iloc[i]
+            d = (2/3) * d_values[-1] + (1/3) * k
+            k_values.append(k)
+            d_values.append(d)
+        
+        group['K'] = k_values
+        group['D'] = d_values
         group['J'] = 3 * group['K'] - 2 * group['D']
+        group['K'] = group['K'].fillna(50)
+        group['D'] = group['D'].fillna(50)
+        group['J'] = group['J'].fillna(50)
         return group
+    
     df = df.groupby('code', group_keys=False).apply(calc_kdj)
     
     # ========== RSI ==========
@@ -143,6 +170,7 @@ def calculate_indicators(df):
         loss = (-delta.where(delta < 0, 0)).rolling(14, min_periods=1).mean()
         rs = gain / loss
         group['RSI'] = 100 - (100 / (1 + rs))
+        group['RSI'] = group['RSI'].fillna(50)
         return group
     df = df.groupby('code', group_keys=False).apply(calc_rsi)
     
@@ -158,6 +186,8 @@ def calculate_indicators(df):
         tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
         group['ATR'] = tr.rolling(14, min_periods=1).mean()
         group['stop_loss'] = group['close'] - 2 * group['ATR']
+        group['ATR'] = group['ATR'].fillna(group['close'] * 0.02)
+        group['stop_loss'] = group['stop_loss'].fillna(group['close'] * 0.95)
         return group
     df = df.groupby('code', group_keys=False).apply(calc_atr)
     
@@ -165,14 +195,17 @@ def calculate_indicators(df):
     df['MA5_shift'] = df.groupby('code')['MA5'].shift(1)
     df['MA10_shift'] = df.groupby('code')['MA10'].shift(1)
     df['golden_cross'] = (df['MA5'] > df['MA10']) & (df['MA5_shift'] <= df['MA10_shift'])
+    df['golden_cross'] = df['golden_cross'].fillna(False)
     
     # 多头排列
     df['bullish_arrange'] = (df['MA5'] > df['MA10']) & (df['MA10'] > df['MA20'])
+    df['bullish_arrange'] = df['bullish_arrange'].fillna(False)
     
     # 放量检测
     df['volume_surge_3d'] = df.groupby('code')['volume'].transform(
         lambda x: x.rolling(3, min_periods=1).mean() / x.rolling(10, min_periods=1).mean()
     )
+    df['volume_surge_3d'] = df['volume_surge_3d'].fillna(1)
     
     # 连续放量天数
     def calc_consecutive_surge(group):
@@ -187,6 +220,7 @@ def calculate_indicators(df):
         group['consecutive_surge'] = surge_days
         return group
     df = df.groupby('code', group_keys=False).apply(calc_consecutive_surge)
+    df['consecutive_surge'] = df['consecutive_surge'].fillna(0)
     
     # 删除临时列
     df = df.drop(['MA5_shift', 'MA10_shift'], axis=1, errors='ignore')
@@ -233,7 +267,10 @@ def exclude_limit_up(df):
         return False, ""
     
     latest = df.iloc[-1]
-    pct_chg = (latest['close'] - latest['open']) / latest['open'] if latest['open'] > 0 else 0
+    if latest['open'] <= 0:
+        return False, ""
+    
+    pct_chg = (latest['close'] - latest['open']) / latest['open']
     
     if pct_chg > 0.095:
         return True, "打板中"
@@ -323,7 +360,7 @@ def exclude_low_volatility(df, min_atr_pct=0.01):
     volatility = atr / close
     
     if volatility < min_atr_pct:
-        return True, f"波动过小(ATR/价格={volatility:.2%})"
+        return True, f"波动过小"
     return False, ""
 
 
@@ -546,7 +583,7 @@ with st.sidebar:
     - ❌ 空头绿十字K线
     - ❌ MACD绿峰
     - ❌ KDJ超买区/峰顶已过
-    - ❌ 波动过小(ATR/价格<1%)
+    - ❌ 波动过小
     """)
     
     st.markdown("### ✅ 加分项")
@@ -627,7 +664,7 @@ with st.expander("📖 使用说明"):
     st.markdown("""
     ### 风险排除法核心逻辑
     
-    本程序基于你的**风险排除法**实现：
+    本程序基于**风险排除法**实现：
     
     1. **K线高位排除**：股价处于近期高位（>75%分位）的排除
     2. **连续拉升排除**：连续3天涨幅>4%的排除
