@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 A股量价战法选股系统 - 后台扫描脚本
-用于 GitHub Actions 定时运行
+用于 GitHub Actions 定时运行，完成后自动发送邮件
 """
 import pandas as pd
 import akshare as ak
@@ -10,6 +10,11 @@ import numpy as np
 from datetime import datetime, timedelta
 import time
 import os
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -19,6 +24,54 @@ DAYS = 60
 MIN_SCORE = 50
 MAX_RETRIES = 3
 RETRY_DELAY = 2
+
+# 邮件配置（使用 GitHub Secrets 存储）
+SMTP_SERVER = "smtp.126.com"
+SMTP_PORT = 465
+SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "")
+SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD", "")
+RECEIVER_EMAIL = "zhangyong_zhongyao@126.com"
+
+# ==================== 邮件发送函数 ====================
+def send_email(subject, body, attachment_path=None):
+    """发送邮件"""
+    if not SENDER_EMAIL or not SENDER_PASSWORD:
+        print("邮件配置缺失，跳过发送")
+        return False
+    
+    try:
+        # 创建邮件
+        msg = MIMEMultipart()
+        msg['From'] = SENDER_EMAIL
+        msg['To'] = RECEIVER_EMAIL
+        msg['Subject'] = subject
+        
+        # 邮件正文
+        msg.attach(MIMEText(body, 'plain', 'utf-8'))
+        
+        # 添加附件
+        if attachment_path and os.path.exists(attachment_path):
+            with open(attachment_path, 'rb') as f:
+                part = MIMEBase('application', 'octet-stream')
+                part.set_payload(f.read())
+                encoders.encode_base64(part)
+                part.add_header(
+                    'Content-Disposition',
+                    f'attachment; filename={os.path.basename(attachment_path)}'
+                )
+                msg.attach(part)
+        
+        # 发送邮件
+        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
+            server.login(SENDER_EMAIL, SENDER_PASSWORD)
+            server.send_message(msg)
+        
+        print(f"邮件发送成功: {subject}")
+        return True
+        
+    except Exception as e:
+        print(f"邮件发送失败: {e}")
+        return False
 
 # ==================== 带重试的数据获取 ====================
 def fetch_with_retry(func, *args, **kwargs):
@@ -136,13 +189,11 @@ def calculate_indicators(df):
         df['ATR'] = df['close'] * 0.02
         df['stop_loss'] = df['close'] * 0.95
     
-    # 金叉和多头排列
     df['golden_cross'] = (df['MA5'] > df['MA10']) & (df['MA5'].shift(1) <= df['MA10'].shift(1))
     df['golden_cross'] = df['golden_cross'].fillna(False)
     df['bullish_arrange'] = (df['MA5'] > df['MA10']) & (df['MA10'] > df['MA20'])
     df['bullish_arrange'] = df['bullish_arrange'].fillna(False)
     
-    # 连续放量
     consecutive = 0
     surge_days = []
     for vol, vol_ma5 in zip(df['volume'], df['VOL_MA5']):
@@ -232,12 +283,44 @@ def apply_risk_exclusion(df):
     
     return False
 
+# ==================== 量价信号 ====================
+def get_volume_signals(df):
+    if df.empty or len(df) < 10:
+        return [], []
+    
+    latest = df.iloc[-1]
+    risk_signals = []
+    opp_signals = []
+    
+    if latest.get('上涨梯量', False):
+        risk_signals.append("上涨梯量")
+    if latest.get('碰压力位', False):
+        risk_signals.append("碰压力位")
+    if latest.get('缩量平量反弹', False):
+        risk_signals.append("缩量平量反弹")
+    
+    if latest.get('下跌高量累计', 0) >= 3:
+        opp_signals.append("三次高量见底")
+    if latest.get('底分型', False):
+        opp_signals.append("底分型")
+    if latest.get('红三兵', False):
+        opp_signals.append("红三兵")
+    if latest.get('下跌梯量', False):
+        opp_signals.append("下跌梯量")
+    if latest.get('golden_cross', False):
+        opp_signals.append("金叉")
+    if latest.get('bullish_arrange', False):
+        opp_signals.append("多头排列")
+    
+    return risk_signals, opp_signals
+
 # ==================== 评分 ====================
 def calculate_score(df):
     if df.empty:
         return 0
     
     latest = df.iloc[-1]
+    risk_signals, opp_signals = get_volume_signals(df)
     score = 50
     
     if latest.get('bullish_arrange', False):
@@ -252,19 +335,16 @@ def calculate_score(df):
         score += 10
     if latest.get('下跌高量累计', 0) >= 3:
         score += 15
-    if latest.get('底分型', False) and latest['close'] > latest.get('支撑位', 0):
+    if latest.get('底分型', False):
         score += 15
-    if latest.get('红三兵', False) and latest['close'] > latest.get('支撑位', 0):
+    if latest.get('红三兵', False):
         score += 15
     if latest.get('下跌梯量', False):
         score += 10
     
-    # 风险减分
     if latest.get('上涨梯量', False):
         score -= 15
     if latest.get('碰压力位', False):
-        score -= 10
-    if latest.get('缩量平量反弹', False):
         score -= 10
     
     return min(max(score, 0), 100)
@@ -285,22 +365,7 @@ def process_stock(code, days=60):
         return None
     
     latest = df.iloc[-1]
-    
-    # 获取信号
-    risk_signals = []
-    opp_signals = []
-    if latest.get('上涨梯量', False):
-        risk_signals.append("上涨梯量")
-    if latest.get('碰压力位', False):
-        risk_signals.append("碰压力位")
-    if latest.get('下跌高量累计', 0) >= 3:
-        opp_signals.append("三次高量")
-    if latest.get('底分型', False):
-        opp_signals.append("底分型")
-    if latest.get('红三兵', False):
-        opp_signals.append("红三兵")
-    if latest.get('下跌梯量', False):
-        opp_signals.append("下跌梯量")
+    risk_signals, opp_signals = get_volume_signals(df)
     
     if len(risk_signals) > 0:
         action = "观望"
@@ -343,41 +408,121 @@ def scan_all_stocks(codes, days=60):
             all_results.append(result)
         
         if idx % 50 == 0:
-            time.sleep(0.5)  # 避免请求过快
+            time.sleep(0.5)
     
     return all_results
 
+# ==================== 生成邮件内容 ====================
+def generate_email_body(df_result, total_stocks, scan_time):
+    """生成邮件正文"""
+    buy_count = len(df_result[df_result['操作建议'] == '买入'])
+    watch_count = len(df_result[df_result['操作建议'] == '关注'])
+    hold_count = len(df_result[df_result['操作建议'] == '持有'])
+    
+    # 买入信号股票列表
+    buy_stocks = df_result[df_result['操作建议'] == '买入'].head(10)
+    watch_stocks = df_result[df_result['操作建议'] == '关注'].head(10)
+    
+    body = f"""
+========================================
+A股量价战法选股系统 - 扫描报告
+========================================
+
+扫描时间: {scan_time}
+扫描股票: {total_stocks} 只
+入选股票: {len(df_result)} 只
+
+📊 统计摘要:
+- 买入信号: {buy_count} 只
+- 关注信号: {watch_count} 只  
+- 持有观望: {hold_count} 只
+- 最高评分: {df_result['评分'].max()}
+- 平均评分: {df_result['评分'].mean():.1f}
+
+{'='*40}
+🔴 买入信号股票 Top 10:
+{'='*40}
+"""
+    
+    if buy_count > 0:
+        for _, row in buy_stocks.iterrows():
+            body += f"\n{row['代码']} | 收盘:{row['收盘']} | RSI:{row['RSI']} | 量比:{row['量比']} | 评分:{row['评分']}"
+            if row['机会信号'] != '无':
+                body += f"\n  机会: {row['机会信号']}"
+    else:
+        body += "\n暂无买入信号股票"
+    
+    body += f"""
+
+{'='*40}
+🟡 关注信号股票 Top 10:
+{'='*40}
+"""
+    
+    if watch_count > 0:
+        for _, row in watch_stocks.iterrows():
+            body += f"\n{row['代码']} | 收盘:{row['收盘']} | RSI:{row['RSI']} | 量比:{row['量比']} | 评分:{row['评分']}"
+            if row['机会信号'] != '无':
+                body += f"\n  机会: {row['机会信号']}"
+    else:
+        body += "\n暂无关注信号股票"
+    
+    body += f"""
+
+{'='*40}
+📈 评分分布:
+{'='*40}
+- 90分以上: {len(df_result[df_result['评分'] >= 90])} 只
+- 80-89分: {len(df_result[(df_result['评分'] >= 80) & (df_result['评分'] < 90)])} 只
+- 70-79分: {len(df_result[(df_result['评分'] >= 70) & (df_result['评分'] < 80)])} 只
+- 60-69分: {len(df_result[(df_result['评分'] >= 60) & (df_result['评分'] < 70)])} 只
+- 50-59分: {len(df_result[(df_result['评分'] >= 50) & (df_result['评分'] < 60)])} 只
+
+========================================
+详细数据请查看附件 CSV 文件
+系统每天自动运行，如有问题请及时反馈
+========================================
+"""
+    
+    return body
+
 # ==================== 主函数 ====================
 def main():
-    print(f"开始扫描 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    scan_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print(f"开始扫描 - {scan_time}")
     
     # 获取股票列表
     codes = get_all_stock_codes()
     if not codes:
         print("获取股票列表失败")
+        send_email(
+            subject=f"【错误】A股选股系统 - {datetime.now().strftime('%Y-%m-%d')}",
+            body=f"扫描时间: {scan_time}\n\n错误: 获取股票列表失败\n\n请检查网络或数据源"
+        )
         return
     
-    print(f"获取到 {len(codes)} 只股票")
+    total_stocks = len(codes)
+    print(f"获取到 {total_stocks} 只股票")
     
     # 扫描
     results = scan_all_stocks(codes, DAYS)
     
     if not results:
         print("没有符合条件的股票")
+        send_email(
+            subject=f"【结果】A股选股系统 - {datetime.now().strftime('%Y-%m-%d')}",
+            body=f"扫描时间: {scan_time}\n扫描股票: {total_stocks}\n\n没有符合条件的股票，请调整评分阈值"
+        )
         return
     
-    # 转换为DataFrame
+    # 保存结果
     df_result = pd.DataFrame(results).sort_values('评分', ascending=False)
     
-    # 创建结果目录
     os.makedirs('results', exist_ok=True)
     
-    # 保存结果
     today = datetime.now().strftime('%Y-%m-%d')
     filename = f"results/{today}.csv"
     df_result.to_csv(filename, index=False, encoding='utf-8-sig')
-    
-    # 同时保存最新结果（覆盖）
     df_result.to_csv('results/latest.csv', index=False, encoding='utf-8-sig')
     
     print(f"扫描完成！共选出 {len(results)} 只股票")
@@ -385,7 +530,14 @@ def main():
     print(f"最高评分: {df_result['评分'].max()}")
     print(f"平均评分: {df_result['评分'].mean():.1f}")
     print(f"买入信号: {len(df_result[df_result['操作建议'] == '买入'])} 只")
-    print(f"关注信号: {len(df_result[df_result['操作建议'] == '关注'])} 只")
+    
+    # 发送邮件
+    body = generate_email_body(df_result, total_stocks, scan_time)
+    send_email(
+        subject=f"【选股结果】A股量价战法 - {today} (入选{len(results)}只)",
+        body=body,
+        attachment_path=filename
+    )
 
 if __name__ == "__main__":
     main()
