@@ -1,7 +1,229 @@
-import akshare as ak
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+后端扫描脚本 - 由 GitHub Actions 定时运行
+功能：获取全市场股票数据，计算评分，保存结果到 top_stocks.csv
+"""
 import pandas as pd
+import akshare as ak
+import numpy as np
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import warnings
+warnings.filterwarnings('ignore')
 
-df = ak.stock_zh_a_spot_em()
-df = df[df['代码'].str.match(r'(60|00|30)')]
-df[['代码', '名称']].to_csv('stock_list.csv', index=False, encoding='utf-8')
-print(f"已生成 {len(df)} 只股票的列表，文件名为 stock_list.csv")
+# ==================== 配置参数 ====================
+HISTORY_DAYS = 60          # 历史数据天数
+MIN_SCORE = 60              # 最低评分阈值
+MAX_WORKERS = 8             # 并行线程数
+MAX_STOCKS = 2000           # 最多扫描股票数（0=全部）
+
+# ==================== 数据获取模块 ====================
+def get_all_stock_codes():
+    """获取沪深A股（含创业板）全部股票代码"""
+    try:
+        stock_df = ak.stock_zh_a_spot_em()
+        stock_df = stock_df[stock_df['代码'].str.match(r'(60|00|30)')]
+        codes = stock_df['代码'].tolist()
+        names = stock_df['名称'].tolist()
+        return codes, names
+    except Exception as e:
+        print(f"获取股票列表失败: {e}")
+        return [], []
+
+def fetch_stock_data_worker(code, days=60):
+    """获取单只股票历史数据"""
+    try:
+        end_date = datetime.now().strftime("%Y%m%d")
+        start_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
+        df = ak.stock_zh_a_hist(symbol=code, period="daily",
+                                start_date=start_date, end_date=end_date, adjust="qfq")
+        if df.empty:
+            return None
+        df.rename(columns={
+            '日期': 'date', '开盘': 'open', '收盘': 'close',
+            '最高': 'high', '最低': 'low', '成交量': 'volume'
+        }, inplace=True)
+        df['code'] = code
+        return df[['code', 'date', 'open', 'high', 'low', 'close', 'volume']]
+    except Exception:
+        return None
+
+def get_all_stocks_data_parallel(codes, days=60, max_workers=8):
+    """线程池并行获取数据"""
+    results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(fetch_stock_data_worker, code, days): code for code in codes}
+        for future in as_completed(futures):
+            result = future.result()
+            if result is not None:
+                results.append(result)
+    if results:
+        return pd.concat(results, ignore_index=True)
+    return pd.DataFrame()
+
+# ==================== 技术指标计算 ====================
+def calculate_indicators(df):
+    """计算技术指标（向量化）"""
+    if df.empty:
+        return df
+    
+    # 移动平均线
+    df['MA5'] = df.groupby('code')['close'].transform(lambda x: x.rolling(5, min_periods=1).mean())
+    df['MA10'] = df.groupby('code')['close'].transform(lambda x: x.rolling(10, min_periods=1).mean())
+    df['MA20'] = df.groupby('code')['close'].transform(lambda x: x.rolling(20, min_periods=1).mean())
+    df['MA60'] = df.groupby('code')['close'].transform(lambda x: x.rolling(60, min_periods=1).mean())
+    
+    # MACD
+    def macd_group(group):
+        exp1 = group['close'].ewm(span=12, adjust=False).mean()
+        exp2 = group['close'].ewm(span=26, adjust=False).mean()
+        group['MACD'] = exp1 - exp2
+        group['MACD_signal'] = group['MACD'].ewm(span=9, adjust=False).mean()
+        return group
+    df = df.groupby('code', group_keys=False).apply(macd_group)
+    
+    # RSI
+    def rsi_group(group):
+        delta = group['close'].diff()
+        gain = delta.where(delta > 0, 0).rolling(14, min_periods=1).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14, min_periods=1).mean()
+        rs = gain / loss
+        group['RSI'] = 100 - (100 / (1 + rs))
+        return group
+    df = df.groupby('code', group_keys=False).apply(rsi_group)
+    
+    # 成交量均线
+    df['VOL_MA5'] = df.groupby('code')['volume'].transform(lambda x: x.rolling(5, min_periods=1).mean())
+    
+    # 金叉死叉
+    df['golden_cross'] = (df['MA5'] > df['MA10']) & (df.groupby('code')['MA5'].shift(1) <= df.groupby('code')['MA10'].shift(1))
+    
+    # 多头排列
+    df['bullish_arrange'] = (df['MA5'] > df['MA10']) & (df['MA10'] > df['MA20']) & (df['MA20'] > df['MA60'])
+    
+    # 量比
+    df['volume_ratio'] = df.groupby('code')['volume'].transform(lambda x: x / x.rolling(5, min_periods=1).mean())
+    
+    # ATR
+    def atr_group(group):
+        high_low = group['high'] - group['low']
+        high_close = (group['high'] - group['close'].shift()).abs()
+        low_close = (group['low'] - group['close'].shift()).abs()
+        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        group['ATR'] = tr.rolling(14, min_periods=1).mean()
+        group['stop_loss'] = group['close'] - 2 * group['ATR']
+        return group
+    df = df.groupby('code', group_keys=False).apply(atr_group)
+    df['ADX'] = 25  # 简化
+    
+    return df
+
+def score_stock(group):
+    """对单只股票评分"""
+    latest = group.iloc[-1]
+    score = 0
+    if latest['bullish_arrange']:
+        score += 25
+    elif latest['MA5'] > latest['MA20']:
+        score += 10
+    if latest['golden_cross']:
+        score += 15
+    if 30 <= latest['RSI'] <= 50:
+        score += 10
+    elif 50 < latest['RSI'] <= 70:
+        score += 5
+    if latest['volume_ratio'] > 1.5:
+        score += 10
+    if latest['volume'] > latest['VOL_MA5'] * 1.2:
+        score += 10
+    if 0.02 <= latest['ATR'] / latest['close'] <= 0.05:
+        score += 10
+    return min(score, 100)
+
+def filter_stocks_by_score(all_data, min_score=60):
+    """筛选评分达标的股票"""
+    if all_data.empty:
+        return pd.DataFrame()
+    
+    all_data = calculate_indicators(all_data)
+    
+    results = []
+    for code, group in all_data.groupby('code'):
+        if len(group) < 30:
+            continue
+        group = group.sort_values('date')
+        score = score_stock(group)
+        latest = group.iloc[-1]
+        results.append({
+            '代码': latest['code'],
+            '名称': '',  # 需要单独获取名称
+            '收盘价': round(latest['close'], 2),
+            'MA5': round(latest['MA5'], 2),
+            'MA10': round(latest['MA10'], 2),
+            'MA20': round(latest['MA20'], 2),
+            'RSI': round(latest['RSI'], 1),
+            '量比': round(latest['volume_ratio'], 2),
+            'ATR': round(latest['ATR'], 2),
+            '止损参考': round(latest['stop_loss'], 2),
+            '评分': score
+        })
+    
+    df_result = pd.DataFrame(results)
+    if not df_result.empty:
+        df_result = df_result[df_result['评分'] >= min_score].sort_values('评分', ascending=False)
+    
+    # 补充股票名称
+    if not df_result.empty:
+        try:
+            stock_info = ak.stock_zh_a_spot_em()
+            name_dict = dict(zip(stock_info['代码'], stock_info['名称']))
+            df_result['名称'] = df_result['代码'].map(name_dict).fillna('')
+        except:
+            pass
+    
+    return df_result
+
+# ==================== 主函数 ====================
+def main():
+    print(f"开始扫描 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    # 获取股票列表
+    codes, names = get_all_stock_codes()
+    if not codes:
+        print("获取股票列表失败")
+        return
+    
+    print(f"获取到 {len(codes)} 只股票")
+    
+    # 限制扫描数量
+    if MAX_STOCKS > 0 and len(codes) > MAX_STOCKS:
+        codes = codes[:MAX_STOCKS]
+        print(f"限制扫描数量为 {len(codes)} 只")
+    
+    # 获取数据
+    print(f"开始获取数据（历史{HISTORY_DAYS}天，{MAX_WORKERS}线程）...")
+    all_data = get_all_stocks_data_parallel(codes, HISTORY_DAYS, MAX_WORKERS)
+    if all_data.empty:
+        print("数据获取失败")
+        return
+    
+    print(f"成功获取 {len(all_data['code'].unique())} 只股票数据")
+    
+    # 计算评分
+    print("开始计算评分...")
+    scored_df = filter_stocks_by_score(all_data, MIN_SCORE)
+    
+    if scored_df.empty:
+        print(f"没有股票达到评分阈值 {MIN_SCORE}")
+        # 保存空结果（清空）
+        pd.DataFrame(columns=['代码', '名称', '收盘价', 'MA5', 'MA10', 'MA20', 'RSI', '量比', 'ATR', '止损参考', '评分']).to_csv('top_stocks.csv', index=False, encoding='utf-8')
+    else:
+        print(f"筛选出 {len(scored_df)} 只股票，最高评分 {scored_df['评分'].iloc[0]}")
+        scored_df.to_csv('top_stocks.csv', index=False, encoding='utf-8')
+    
+    print(f"结果已保存到 top_stocks.csv")
+    print(f"扫描完成 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+if __name__ == "__main__":
+    main()
