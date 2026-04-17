@@ -26,9 +26,6 @@ jobs:
       
       - name: 运行扫描脚本
         run: python scanner.py
-        env:
-          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
-          SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
       
       - name: 上传结果到仓库
         run: |
