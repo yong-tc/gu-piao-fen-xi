@@ -10,28 +10,21 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ==================== 配置 ====================
-DEFAULT_MAX_STOCKS = 200
+BATCH_SIZE = 200  # 每批处理200只股票
 DEFAULT_DAYS = 60
 DEFAULT_WORKERS = 4
 
-# ==================== 股票列表获取 ====================
+# ==================== 获取全市场股票列表 ====================
 @st.cache_data(ttl=3600)
-def get_stock_list_by_metric(sort_by="成交额", max_stocks=200):
-    """获取股票列表，支持按成交额或涨跌幅排序"""
+def get_all_stock_codes():
+    """获取沪深A股+创业板全部股票代码"""
     try:
         df = ak.stock_zh_a_spot_em()
+        # 筛选沪深A股 + 创业板（60/00/30开头）
         df = df[df['代码'].str.match(r'(60|00|30)')]
-        
-        if sort_by == "成交额":
-            df = df.sort_values('成交额', ascending=False)
-        else:
-            df = df.sort_values('涨跌幅', ascending=False)
-        
-        codes = df['代码'].tolist()[:max_stocks]
-        names = df['名称'].tolist()[:max_stocks]
-        
+        codes = df['代码'].tolist()
+        names = df['名称'].tolist()
         return codes, names
-        
     except Exception as e:
         st.error(f"获取股票列表失败: {e}")
         return [], []
@@ -60,28 +53,7 @@ def fetch_stock_data(code, days=60):
     except Exception:
         return None
 
-def get_data_batch(codes, days=60, max_workers=4):
-    """并行获取数据"""
-    results = []
-    progress_bar = st.progress(0)
-    total = len(codes)
-    
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(fetch_stock_data, code, days): idx for idx, code in enumerate(codes)}
-        
-        for idx, future in enumerate(as_completed(futures)):
-            result = future.result()
-            if result is not None:
-                results.append(result)
-            progress_bar.progress((idx + 1) / total)
-    
-    progress_bar.empty()
-    
-    if results:
-        return pd.concat(results, ignore_index=True)
-    return pd.DataFrame()
-
-# ==================== 单只股票指标计算（避免groupby问题） ====================
+# ==================== 单只股票指标计算 ====================
 def calculate_single_stock_indicators(df):
     """计算单只股票的所有技术指标"""
     if df.empty or len(df) < 30:
@@ -120,7 +92,7 @@ def calculate_single_stock_indicators(df):
         df['MACD_signal'] = 0
         df['MACD_hist'] = 0
     
-    # KDJ（使用循环计算，避免ewm问题）
+    # KDJ
     if len(df) >= 9:
         low_list = df['low'].rolling(9, min_periods=1).min()
         high_list = df['high'].rolling(9, min_periods=1).max()
@@ -304,11 +276,9 @@ def exclude_kdj_peak(df, lookback=20):
     latest_k = df['K'].iloc[-1]
     latest_j = df['J'].iloc[-1]
     
-    # KDJ超买区
     if latest_k > 80 and latest_j > 100:
         return True, "KDJ超买区"
     
-    # 峰顶已过（从高位回落）
     if len(df) >= 3:
         if df['K'].iloc[-2] > 80 and df['K'].iloc[-1] < df['K'].iloc[-2]:
             return True, "KDJ峰顶已过"
@@ -355,7 +325,6 @@ def apply_risk_exclusion(df):
     exclude_reasons = []
     bonus_reasons = []
     
-    # 排除规则
     is_excluded, reason = exclude_high_position(df)
     if is_excluded:
         exclude_reasons.append(reason)
@@ -384,7 +353,6 @@ def apply_risk_exclusion(df):
     if is_excluded:
         exclude_reasons.append(reason)
     
-    # 加分项
     if is_macd_red_early_stage(df):
         bonus_reasons.append("MACD红峰初期")
     
@@ -446,35 +414,26 @@ def calculate_final_score(df):
     return min(score, 100)
 
 
-def filter_stocks_with_exclusion(codes, days=60, min_score=50, max_workers=4, progress_callback=None):
-    """风险排除版选股 - 逐只处理，避免内存问题"""
-    results = []
-    total = len(codes)
+def process_batch(codes, batch_id, total_batches, days=60, min_score=50):
+    """处理一批股票"""
+    batch_results = []
     
-    for idx, code in enumerate(codes):
-        if progress_callback:
-            progress_callback(idx + 1, total)
-        
-        # 获取单只股票数据
+    for code in codes:
         df = fetch_stock_data(code, days)
         if df is None or df.empty or len(df) < 30:
             continue
         
-        # 计算指标
         df = calculate_single_stock_indicators(df)
-        
-        # 应用风险排除
         is_excluded, exclude_reasons, bonus_reasons = apply_risk_exclusion(df)
         
         if is_excluded:
             continue
         
-        # 计算得分
         score = calculate_final_score(df)
         
         if score >= min_score:
             latest = df.iloc[-1]
-            results.append({
+            batch_results.append({
                 '代码': code,
                 '收盘': round(latest['close'], 2),
                 'MA5': round(latest['MA5'], 2),
@@ -490,12 +449,45 @@ def filter_stocks_with_exclusion(codes, days=60, min_score=50, max_workers=4, pr
                 '加分项': ','.join(bonus_reasons) if bonus_reasons else ''
             })
         
-        # 定期释放内存
-        if idx % 50 == 0:
-            gc.collect()
+        # 释放内存
+        del df
+        gc.collect()
     
-    if results:
-        return pd.DataFrame(results).sort_values('评分', ascending=False)
+    return batch_results
+
+
+def scan_all_stocks(codes, days=60, min_score=50, batch_size=BATCH_SIZE):
+    """分批扫描全市场股票"""
+    total = len(codes)
+    num_batches = (total + batch_size - 1) // batch_size
+    
+    all_results = []
+    
+    # 创建进度条
+    batch_progress = st.progress(0)
+    batch_status = st.empty()
+    
+    for batch_idx in range(num_batches):
+        start_idx = batch_idx * batch_size
+        end_idx = min(start_idx + batch_size, total)
+        batch_codes = codes[start_idx:end_idx]
+        
+        batch_status.text(f"正在处理第 {batch_idx + 1}/{num_batches} 批 (股票 {start_idx + 1}-{end_idx}/{total})")
+        
+        batch_results = process_batch(batch_codes, batch_idx, num_batches, days, min_score)
+        all_results.extend(batch_results)
+        
+        # 更新进度
+        batch_progress.progress((batch_idx + 1) / num_batches)
+        
+        # 每批结束后强制释放内存
+        gc.collect()
+    
+    batch_status.empty()
+    batch_progress.empty()
+    
+    if all_results:
+        return pd.DataFrame(all_results).sort_values('评分', ascending=False)
     return pd.DataFrame()
 
 # ==================== 大盘趋势 ====================
@@ -518,22 +510,24 @@ def get_market_trend():
 st.set_page_config(page_title="A股风险排除选股系统", layout="wide")
 st.title("🛡️ A股风险排除选股系统")
 st.markdown("基于**风险排除法**：K线高位排除 | 连续拉升排除 | MACD绿峰排除 | KDJ峰值排除 | 波动过小排除")
+st.info("📌 分批处理模式：每批200只股票，覆盖沪深A股+创业板全市场")
 
 with st.sidebar:
     st.header("⚙️ 参数设置")
     
-    sort_method = st.radio(
-        "股票排序方式",
-        ["成交额排序（活跃股票）", "涨跌幅排序（强势股票）"]
-    )
-    
-    max_stocks = st.slider("扫描股票数量", 50, 500, 150, 50)
     days = st.slider("历史数据天数", 30, 90, 60, 10)
     min_score = st.slider("最低评分阈值", 30, 80, 50, 5)
-    workers = st.slider("并行线程数", 2, 6, 3, 1)
     use_market_filter = st.checkbox("大盘过滤", True)
     
     st.markdown("---")
+    st.markdown("### 📊 扫描模式")
+    st.markdown(f"""
+    - **分批数量**: 每批 {BATCH_SIZE} 只
+    - **总股票数**: 约5000只
+    - **总批次数**: 约{(5000 + BATCH_SIZE - 1) // BATCH_SIZE}批
+    - **预计耗时**: 15-30分钟
+    """)
+    
     st.markdown("### 🚫 风险排除规则")
     st.markdown("""
     - ❌ K线高位（>75%位置）
@@ -555,7 +549,7 @@ with st.sidebar:
     - ⭐ 金叉信号
     """)
     
-    if st.button("🚀 开始扫描", type="primary"):
+    if st.button("🚀 开始全市场扫描", type="primary"):
         st.session_state['run'] = True
 
 if 'run' in st.session_state and st.session_state['run']:
@@ -565,32 +559,19 @@ if 'run' in st.session_state and st.session_state['run']:
         st.session_state['run'] = False
         st.stop()
     
-    # 获取股票列表
-    with st.spinner("获取股票列表..."):
-        sort_key = "成交额" if "成交额" in sort_method else "涨跌幅"
-        codes, names = get_stock_list_by_metric(sort_key, max_stocks)
+    # 获取全市场股票列表
+    with st.spinner("获取全市场股票列表（沪深A股+创业板）..."):
+        all_codes, all_names = get_all_stock_codes()
         
-        if not codes:
+        if not all_codes:
             st.error("获取股票列表失败")
             st.stop()
         
-        st.success(f"✅ 已按{sort_key}排序，选取前 {len(codes)} 只股票")
+        st.success(f"✅ 获取到 {len(all_codes)} 只股票（沪深A股+创业板）")
+        st.info(f"📊 将分 {(len(all_codes) + BATCH_SIZE - 1) // BATCH_SIZE} 批处理，每批 {BATCH_SIZE} 只，预计耗时 15-30 分钟")
     
-    # 逐只处理股票
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    def update_progress(current, total):
-        progress_bar.progress(current / total)
-        status_text.text(f"正在处理: {current}/{total} 只股票")
-    
-    with st.spinner("正在应用风险排除规则并计算评分..."):
-        result_df = filter_stocks_with_exclusion(
-            codes, days, min_score, workers, update_progress
-        )
-    
-    progress_bar.empty()
-    status_text.empty()
+    # 分批扫描
+    result_df = scan_all_stocks(all_codes, days, min_score, BATCH_SIZE)
     
     # 显示结果
     if result_df.empty:
@@ -619,9 +600,16 @@ if 'run' in st.session_state and st.session_state['run']:
 
 with st.expander("📖 使用说明"):
     st.markdown("""
-    ### 风险排除法核心逻辑
+    ### 分批处理模式说明
     
-    本程序基于**风险排除法**实现：
+    本程序采用**分批处理**策略覆盖全市场：
+    
+    - **每批处理**: 200只股票
+    - **内存控制**: 每批处理完立即释放内存
+    - **全市场覆盖**: 沪深A股+创业板（约5000只）
+    - **预计耗时**: 15-30分钟（取决于网络和服务器）
+    
+    ### 风险排除法核心逻辑
     
     1. **K线高位排除**：股价处于近期高位（>75%分位）的排除
     2. **连续拉升排除**：连续3天涨幅>4%的排除
