@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import gc
+import io
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -20,10 +21,16 @@ RETRY_DELAY = 2
 # ==================== 初始化 session_state ====================
 if 'scan_started' not in st.session_state:
     st.session_state.scan_started = False
-if 'scan_results' not in st.session_state:
-    st.session_state.scan_results = None
+if 'all_results' not in st.session_state:
+    st.session_state.all_results = []
+if 'current_batch' not in st.session_state:
+    st.session_state.current_batch = 0
+if 'total_batches' not in st.session_state:
+    st.session_state.total_batches = 0
 if 'scan_complete' not in st.session_state:
     st.session_state.scan_complete = False
+if 'batch_results_list' not in st.session_state:
+    st.session_state.batch_results_list = []
 
 # ==================== 带重试的数据获取函数 ====================
 def fetch_with_retry(func, *args, **kwargs):
@@ -75,7 +82,7 @@ def fetch_stock_data(code, days=60):
 
 # ==================== 单只股票指标计算 ====================
 def calculate_single_stock_indicators(df):
-    """计算单只股票的所有技术指标"""
+    """计算单只股票的所有技术指标（含量价战法）"""
     if df.empty or len(df) < 30:
         return df
     
@@ -85,6 +92,7 @@ def calculate_single_stock_indicators(df):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
     
+    # ========== 基础指标 ==========
     # 均线
     df['MA5'] = df['close'].rolling(5, min_periods=1).mean()
     df['MA10'] = df['close'].rolling(10, min_periods=1).mean()
@@ -162,28 +170,39 @@ def calculate_single_stock_indicators(df):
     df['bullish_arrange'] = (df['MA5'] > df['MA10']) & (df['MA10'] > df['MA20'])
     df['bullish_arrange'] = df['bullish_arrange'].fillna(False)
     
+    # 连续放量天数
+    consecutive = 0
+    surge_days = []
+    for vol, vol_ma5 in zip(df['volume'], df['VOL_MA5']):
+        if vol > vol_ma5 * 1.2:
+            consecutive += 1
+        else:
+            consecutive = 0
+        surge_days.append(consecutive)
+    df['consecutive_surge'] = surge_days
+    
     # ========== 量价战法指标 ==========
     
-    # 1. 高量识别：当天成交量大于前三天最大值
+    # 1. 高量识别
     df['前三最高量'] = df['volume'].shift(1).rolling(3).max()
     df['is_高量'] = df['volume'] > df['前三最高量']
     
-    # 2. 高量实体低点（支撑位）
+    # 2. 支撑位（高量实体低点）
     df['实体低点'] = df.apply(lambda x: min(x['open'], x['close']), axis=1)
     df['支撑位'] = df.apply(lambda x: x['实体低点'] if x['is_高量'] else None, axis=1)
     df['支撑位'] = df['支撑位'].ffill()
     
-    # 3. 高量实体高点（压力位）
+    # 3. 压力位（高量实体高点）
     df['实体高点'] = df.apply(lambda x: max(x['open'], x['close']), axis=1)
     df['压力位'] = df.apply(lambda x: x['实体高点'] if x['is_高量'] else None, axis=1)
     df['压力位'] = df['压力位'].ffill()
     
-    # 4. 梯量识别
+    # 4. 梯量
     df['连续放量'] = (df['volume'] > df['volume'].shift(1)) & (df['volume'].shift(1) > df['volume'].shift(2))
     df['上涨梯量'] = df['连续放量'] & (df['close'] > df['close'].shift(1))
     df['下跌梯量'] = df['连续放量'] & (df['close'] < df['close'].shift(1))
     
-    # 5. 下跌趋势中的高量次数
+    # 5. 下跌趋势高量次数
     df['is_下跌趋势'] = df['close'] < df['MA20']
     df['下跌中高量'] = df['is_下跌趋势'] & df['is_高量']
     df['下跌高量累计'] = df['下跌中高量'].rolling(20).sum()
@@ -219,23 +238,6 @@ def calculate_single_stock_indicators(df):
     # 10. 红三兵
     df['is_阳线'] = df['close'] > df['open']
     df['红三兵'] = df['is_阳线'] & df['is_阳线'].shift(1) & df['is_阳线'].shift(2)
-    
-    # 连续放量天数
-    consecutive = 0
-    surge_days = []
-    for vol, vol_ma5 in zip(df['volume'], df['VOL_MA5']):
-        if vol > vol_ma5 * 1.2:
-            consecutive += 1
-        else:
-            consecutive = 0
-        surge_days.append(consecutive)
-    df['consecutive_surge'] = surge_days
-    
-    # 填充NaN
-    for col in ['MA5', 'MA10', 'MA20', 'MA60', 'VOL_MA5', 'VOL_MA10', 
-                'RSI', 'K', 'D', 'J', 'ATR', 'stop_loss', '支撑位', '压力位']:
-        if col in df.columns:
-            df[col] = df[col].fillna(df['close'] if col != 'stop_loss' else df['close'] * 0.95)
     
     return df
 
@@ -318,10 +320,10 @@ def exclude_low_volatility(df, min_atr_pct=0.01):
 
 # ==================== 量价战法信号 ====================
 
-def get_volume_signal(df):
-    """根据量价战法生成交易信号"""
+def get_volume_signals(df):
+    """获取量价战法信号"""
     if df.empty or len(df) < 10:
-        return "观望", [], []
+        return [], [], "观望"
     
     latest = df.iloc[-1]
     risk_signals = []
@@ -332,41 +334,51 @@ def get_volume_signal(df):
         risk_signals.append("上涨梯量=风险")
     
     if latest.get('碰压力位', False):
-        risk_signals.append("上影线碰压力位=减仓")
+        risk_signals.append("上影线碰压力位")
     
     if latest.get('缩量平量反弹', False):
-        risk_signals.append("缩量平量反弹=观望")
+        risk_signals.append("缩量平量反弹")
     
     if latest.get('缩量大长腿', False):
-        risk_signals.append("高量后缩量大长腿=观望")
+        risk_signals.append("高量后缩量大长腿")
     
     # 机会信号
     if latest.get('下跌高量累计', 0) >= 3:
-        opp_signals.append("下跌趋势三次高量=机会")
+        opp_signals.append("三次高量见底")
     
     if latest.get('底分型', False) and latest['close'] > latest.get('支撑位', 0):
-        opp_signals.append("支撑线上方底分型=买入")
+        opp_signals.append("底分型")
     
     if latest.get('红三兵', False) and latest['close'] > latest.get('支撑位', 0):
-        opp_signals.append("支撑线上方红三兵=买入")
+        opp_signals.append("红三兵")
     
     if latest.get('下跌梯量', False):
-        opp_signals.append("下跌梯量=机会")
+        opp_signals.append("下跌梯量")
     
-    # 判断最终操作
+    if latest.get('golden_cross', False):
+        opp_signals.append("金叉")
+    
+    if latest.get('bullish_arrange', False):
+        opp_signals.append("多头排列")
+    
+    # 判断操作建议
     if len(risk_signals) > 0:
-        return "观望/减仓", risk_signals, opp_signals
-    elif len(opp_signals) > 0:
-        return "关注/买入", risk_signals, opp_signals
+        action = "观望/减仓"
+    elif len(opp_signals) >= 2:
+        action = "买入关注"
+    elif len(opp_signals) == 1:
+        action = "关注"
     else:
-        return "观望", risk_signals, opp_signals
+        action = "观望"
+    
+    return risk_signals, opp_signals, action
 
-# ==================== 综合评分 ====================
+# ==================== 风险排除应用 ====================
 
 def apply_risk_exclusion(df):
     """应用所有风险排除规则"""
     if df.empty or len(df) < 30:
-        return True, ["数据不足"], []
+        return True, ["数据不足"]
     
     exclude_reasons = []
     
@@ -400,9 +412,10 @@ def apply_risk_exclusion(df):
     
     return len(exclude_reasons) > 0, exclude_reasons
 
+# ==================== 综合评分 ====================
 
-def calculate_final_score(df):
-    """计算最终得分（风险排除后 + 量价信号加分）"""
+def calculate_score(df):
+    """计算综合评分"""
     if df.empty:
         return 0
     
@@ -412,7 +425,6 @@ def calculate_final_score(df):
     # 技术指标加分
     if latest.get('bullish_arrange', False):
         score += 15
-    
     if latest.get('golden_cross', False):
         score += 15
     
@@ -434,96 +446,80 @@ def calculate_final_score(df):
     elif surge_days >= 2:
         score += 5
     
-    if latest.get('close', 0) > 0:
-        atr_pct = latest.get('ATR', 0) / latest['close']
-        if 0.02 <= atr_pct <= 0.05:
-            score += 5
-    
     # 量价战法加分
-    action, risk_signals, opp_signals = get_volume_signal(df)
+    risk_signals, opp_signals, action = get_volume_signals(df)
     
-    if "买入" in str(opp_signals):
+    if "买入关注" in action:
         score += 20
-    elif "机会" in str(opp_signals):
+    elif "关注" in action:
         score += 10
     
     if len(risk_signals) > 0:
         score -= 15
     
-    return min(max(score, 0), 100), action, risk_signals, opp_signals
+    return min(max(score, 0), 100)
+
+# ==================== 处理单只股票 ====================
+
+def process_single_stock(code, days=60):
+    """处理单只股票，返回结果或None"""
+    df = fetch_stock_data(code, days)
+    if df is None or df.empty or len(df) < 30:
+        return None
+    
+    df = calculate_single_stock_indicators(df)
+    
+    # 风险排除
+    is_excluded, exclude_reasons = apply_risk_exclusion(df)
+    if is_excluded:
+        return None
+    
+    # 计算评分和信号
+    score = calculate_score(df)
+    risk_signals, opp_signals, action = get_volume_signals(df)
+    
+    if score < 50:  # 低于50分不入选
+        return None
+    
+    latest = df.iloc[-1]
+    
+    return {
+        '代码': code,
+        '收盘': round(latest['close'], 2),
+        'MA5': round(latest['MA5'], 2),
+        'MA10': round(latest['MA10'], 2),
+        'MA20': round(latest['MA20'], 2),
+        'RSI': round(latest['RSI'], 1),
+        '量比': round(latest['volume_ratio'], 2),
+        '连续放量': int(latest['consecutive_surge']),
+        '支撑位': round(latest['支撑位'], 2),
+        '压力位': round(latest['压力位'], 2),
+        '风险信号': ';'.join(risk_signals) if risk_signals else '无',
+        '机会信号': ';'.join(opp_signals) if opp_signals else '无',
+        '操作建议': action,
+        '止损参考': round(latest['stop_loss'], 2),
+        '评分': score
+    }
 
 # ==================== 分批处理 ====================
 
-def process_batch(codes, batch_id, total_batches, days=60, min_score=50):
-    """处理一批股票"""
+def process_batch(codes, batch_id, total_batches, days=60, progress_callback=None):
+    """处理一批股票，返回结果列表"""
     batch_results = []
     
-    for code in codes:
-        df = fetch_stock_data(code, days)
-        if df is None or df.empty or len(df) < 30:
-            continue
+    for idx, code in enumerate(codes):
+        if progress_callback:
+            progress_callback(batch_id, idx, len(codes))
         
-        df = calculate_single_stock_indicators(df)
-        is_excluded, exclude_reasons = apply_risk_exclusion(df)
+        result = process_single_stock(code, days)
+        if result:
+            batch_results.append(result)
         
-        if is_excluded:
-            continue
-        
-        score, action, risk_signals, opp_signals = calculate_final_score(df)
-        
-        if score >= min_score:
-            latest = df.iloc[-1]
-            batch_results.append({
-                '代码': code,
-                '收盘': round(latest['close'], 2),
-                'MA5': round(latest['MA5'], 2),
-                'MA10': round(latest['MA10'], 2),
-                'MA20': round(latest['MA20'], 2),
-                'RSI': round(latest['RSI'], 1),
-                '量比': round(latest['volume_ratio'], 2),
-                '连续放量': int(latest['consecutive_surge']),
-                '支撑位': round(latest['支撑位'], 2),
-                '压力位': round(latest['压力位'], 2),
-                '量价信号': ', '.join(opp_signals) if opp_signals else ('风险: ' + ', '.join(risk_signals) if risk_signals else '无'),
-                '操作建议': action,
-                '止损参考': round(latest['stop_loss'], 2),
-                '评分': score
-            })
-        
-        del df
-        gc.collect()
+        # 每10只释放一次内存
+        if idx % 10 == 0:
+            gc.collect()
     
     return batch_results
-
-
-def scan_all_stocks(codes, days=60, min_score=50, batch_size=BATCH_SIZE):
-    """分批扫描全市场股票"""
-    total = len(codes)
-    num_batches = (total + batch_size - 1) // batch_size
-    
-    all_results = []
-    batch_progress = st.progress(0)
-    batch_status = st.empty()
-    
-    for batch_idx in range(num_batches):
-        start_idx = batch_idx * batch_size
-        end_idx = min(start_idx + batch_size, total)
-        batch_codes = codes[start_idx:end_idx]
-        
-        batch_status.text(f"正在处理第 {batch_idx + 1}/{num_batches} 批 (股票 {start_idx + 1}-{end_idx}/{total})")
-        
-        batch_results = process_batch(batch_codes, batch_idx, num_batches, days, min_score)
-        all_results.extend(batch_results)
-        
-        batch_progress.progress((batch_idx + 1) / num_batches)
-        gc.collect()
-    
-    batch_status.empty()
-    batch_progress.empty()
-    
-    if all_results:
-        return pd.DataFrame(all_results).sort_values('评分', ascending=False)
-    return pd.DataFrame()
 
 # ==================== 大盘趋势 ====================
 def get_market_trend():
@@ -542,8 +538,9 @@ def get_market_trend():
 # ==================== Streamlit 界面 ====================
 st.set_page_config(page_title="A股量价战法选股系统", layout="wide")
 st.title("🛡️ A股量价战法选股系统")
-st.markdown("**风险排除法 + 量价关系战法**：高量识别 | 梯量分析 | 支撑压力 | 底分型 | 红三兵")
+st.markdown("**风险排除法 + 量价关系战法** | 分批处理 | 结果可下载")
 
+# 侧边栏
 with st.sidebar:
     st.header("⚙️ 参数设置")
     days = st.slider("历史数据天数", 30, 90, 60, 10)
@@ -554,56 +551,128 @@ with st.sidebar:
     st.markdown("### 📊 量价战法规则")
     st.markdown("""
     **风险信号:**
-    - ⚠️ 上涨梯量=风险
-    - ⚠️ 上影线碰压力位=减仓
-    - ⚠️ 缩量平量反弹=观望
-    - ⚠️ 高量后缩量大长腿=观望
+    - ⚠️ 上涨梯量
+    - ⚠️ 上影线碰压力位
+    - ⚠️ 缩量平量反弹
+    - ⚠️ 高量后缩量大长腿
     
     **机会信号:**
-    - ✅ 下跌趋势三次高量=机会
-    - ✅ 支撑线上方底分型=买入
-    - ✅ 支撑线上方红三兵=买入
-    - ✅ 下跌梯量=机会
+    - ✅ 三次高量见底
+    - ✅ 底分型
+    - ✅ 红三兵
+    - ✅ 下跌梯量
+    - ✅ 金叉/多头排列
     """)
     
-    if st.button("🚀 开始全市场扫描", type="primary"):
+    st.markdown("---")
+    st.markdown("### 🚫 风险排除")
+    st.markdown("""
+    - K线高位 >75%
+    - 连续拉升3天
+    - 打板中
+    - 空头绿十字
+    - MACD绿峰
+    - KDJ超买区
+    - 波动过小
+    """)
+    
+    if st.button("🚀 开始扫描", type="primary"):
         st.session_state.scan_started = True
+        st.session_state.all_results = []
+        st.session_state.batch_results_list = []
+        st.session_state.current_batch = 0
         st.session_state.scan_complete = False
-        st.session_state.scan_results = None
         st.rerun()
 
-# 执行扫描
+# 主区域
 if st.session_state.scan_started and not st.session_state.scan_complete:
+    # 大盘过滤
     if use_market_filter and not get_market_trend():
         st.warning("⚠️ 大盘趋势偏弱，建议谨慎操作")
         st.session_state.scan_started = False
         st.stop()
     
+    # 获取股票列表
     with st.spinner("获取全市场股票列表..."):
         all_codes, all_names = get_all_stock_codes()
         if not all_codes:
             st.error("获取股票列表失败")
             st.session_state.scan_started = False
             st.stop()
-        st.success(f"✅ 获取到 {len(all_codes)} 只股票")
+        
+        total_stocks = len(all_codes)
+        total_batches = (total_stocks + BATCH_SIZE - 1) // BATCH_SIZE
+        st.session_state.total_batches = total_batches
+        
+        st.success(f"✅ 获取到 {total_stocks} 只股票，分 {total_batches} 批处理")
     
-    result_df = scan_all_stocks(all_codes, days, min_score, BATCH_SIZE)
-    st.session_state.scan_results = result_df
+    # 创建进度显示区域
+    progress_area = st.empty()
+    batch_status = st.empty()
+    results_area = st.empty()
+    
+    # 创建下载按钮占位
+    download_area = st.empty()
+    
+    all_results = []
+    
+    for batch_idx in range(total_batches):
+        start_idx = batch_idx * BATCH_SIZE
+        end_idx = min(start_idx + BATCH_SIZE, total_stocks)
+        batch_codes = all_codes[start_idx:end_idx]
+        
+        st.session_state.current_batch = batch_idx + 1
+        
+        # 更新进度显示
+        progress_area.progress((batch_idx + 1) / total_batches)
+        batch_status.text(f"正在处理第 {batch_idx + 1}/{total_batches} 批 | 股票 {start_idx + 1}-{end_idx}/{total_stocks}")
+        
+        # 处理当前批次
+        batch_results = process_batch(batch_codes, batch_idx, total_batches, days)
+        
+        if batch_results:
+            all_results.extend(batch_results)
+            st.session_state.batch_results_list.append(batch_results)
+            
+            # 实时显示当前批次结果
+            temp_df = pd.DataFrame(all_results).sort_values('评分', ascending=False)
+            results_area.dataframe(temp_df, use_container_width=True)
+            
+            # 提供下载按钮
+            csv_data = temp_df.to_csv(index=False, encoding='utf-8-sig')
+            download_area.download_button(
+                label=f"📥 下载当前结果 (共{len(all_results)}只)",
+                data=csv_data,
+                file_name=f"选股结果_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv"
+            )
+        
+        # 批次间释放内存
+        gc.collect()
+    
+    # 扫描完成
+    st.session_state.all_results = all_results
     st.session_state.scan_complete = True
     st.session_state.scan_started = False
+    
+    progress_area.empty()
+    batch_status.empty()
     st.rerun()
 
-# 显示结果
-if st.session_state.scan_complete and st.session_state.scan_results is not None:
-    result_df = st.session_state.scan_results
+# 显示最终结果
+if st.session_state.scan_complete:
+    results = st.session_state.all_results
     
-    if result_df.empty:
+    if not results:
         st.info(f"📭 通过风险排除后，没有股票达到评分阈值 {min_score}")
     else:
-        st.subheader(f"🏆 选股结果（共 {len(result_df)} 只）")
+        result_df = pd.DataFrame(results).sort_values('评分', ascending=False)
+        
+        st.subheader(f"🏆 最终选股结果（共 {len(result_df)} 只）")
         st.dataframe(result_df, use_container_width=True)
         
-        col1, col2, col3, col4 = st.columns(4)
+        # 统计信息
+        col1, col2, col3, col4, col5 = st.columns(5)
         with col1:
             st.metric("入选股票数", len(result_df))
         with col2:
@@ -611,32 +680,59 @@ if st.session_state.scan_complete and st.session_state.scan_results is not None:
         with col3:
             st.metric("平均评分", round(result_df['评分'].mean(), 1))
         with col4:
-            buy_signals = len(result_df[result_df['操作建议'].str.contains('买入', na=False)])
-            st.metric("买入信号", buy_signals)
+            buy_count = len(result_df[result_df['操作建议'].str.contains('买入', na=False)])
+            st.metric("买入信号", buy_count)
+        with col5:
+            watch_count = len(result_df[result_df['操作建议'].str.contains('关注', na=False)])
+            st.metric("关注信号", watch_count)
         
-        if len(result_df) > 0:
-            fig = go.Figure(data=[go.Bar(x=result_df['代码'][:20], y=result_df['评分'][:20])])
-            fig.update_layout(height=400, title="Top 20 股票评分")
-            st.plotly_chart(fig, use_container_width=True)
+        # 评分分布图
+        fig = go.Figure(data=[go.Bar(x=result_df['代码'][:20], y=result_df['评分'][:20])])
+        fig.update_layout(height=400, title="Top 20 股票评分")
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # 下载最终结果
+        csv_final = result_df.to_csv(index=False, encoding='utf-8-sig')
+        st.download_button(
+            label="📥 下载最终选股结果 (CSV)",
+            data=csv_final,
+            file_name=f"选股结果_最终_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv"
+        )
     
-    if st.button("重新扫描"):
+    if st.button("🔄 重新扫描"):
         st.session_state.scan_complete = False
-        st.session_state.scan_results = None
+        st.session_state.all_results = []
+        st.session_state.batch_results_list = []
         st.rerun()
 
 with st.expander("📖 使用说明"):
     st.markdown("""
-    ### 量价战法核心逻辑
+    ### 选股逻辑说明
     
-    本程序结合了**风险排除法**和**量价关系战法**：
+    **第一步：风险排除（过滤）**
+    - K线高位（>75%分位）
+    - 连续拉升3天以上（涨幅>4%/天）
+    - 打板中的股票（涨幅>9.5%）
+    - 空头绿十字K线
+    - MACD绿峰
+    - KDJ超买区（K>80且J>100）
+    - 波动过小（ATR/价格<1%）
     
-    **风险排除（先过滤）:**
-    - K线高位、连续拉升、打板、空头绿十字、MACD绿峰、KDJ超买、波动过小
+    **第二步：量价战法分析（评分）**
+    - 高量识别、支撑/压力位
+    - 梯量分析（上涨梯量=风险，下跌梯量=机会）
+    - 底分型、红三兵
+    - 三次高量见底
     
-    **量价战法（再评分）:**
-    - 高量识别、梯量分析、支撑压力、底分型、红三兵
+    **第三步：综合评分**
+    - 基础分50分
+    - 技术指标加分
+    - 量价信号加分
+    - 风险信号减分
     
-    **操作建议:**
-    - 关注/买入：出现机会信号，可加入观察
-    - 观望/减仓：出现风险信号，谨慎操作
+    **分批处理模式**
+    - 每批200只股票
+    - 每批结果可实时下载
+    - 最终结果合并展示
     """)
